@@ -7,15 +7,16 @@ import { chatDir, loadChat, logsDir, openLog, readLog, refsDir, saveRefImage, sa
 
 const project = () => mkdtempSync(join(tmpdir(), 'of-chat-'));
 const turn = (id, createdAt) => ({ turn: { id, createdAt, sessionId: 's1', prompt: id }, items: [{ kind: 'text', text: id }] });
-/** a turn's log is written through a stream: wait until its lines are on disk (a slow runner needs more than a fixed pause) */
-async function logOnDisk(dir, id, lines = 1) {
+/** a turn's log is written through a stream: wait until what a reader needs is on disk (a slow runner needs more than a fixed pause) */
+async function until(fn, ok) {
   for (let i = 0; i < 500; i += 1) {
-    const read = readLog(dir, id);
-    if (read && read.events.length >= lines) return read;
+    const value = fn();
+    if (ok(value)) return value;
     await new Promise((done) => setTimeout(done, 10));
   }
-  return readLog(dir, id);
+  return fn();
 }
+const logOnDisk = (dir, id, lines = 1) => until(() => readLog(dir, id), (read) => Boolean(read && read.events.length >= lines));
 
 test('a project with no chat yet has none; what is saved comes back, the turns in the order they were asked', () => {
   const dir = project();
@@ -79,13 +80,11 @@ test('a turn\'s model requests are kept beside its log and read back with it', a
   const log = openLog(dir, 'local:m1', () => {}, '.model');
   log.write('call', { startedAt: 1, ms: 2, prefix: 0, messages: [{ role: 'user', content: 'hi' }], params: { model: 'm' }, response: null, error: null });
   log.end();
-  await new Promise((done) => setTimeout(done, 50));
   assert.equal(readLog(dir, 'local:m1'), null, 'no log of its own, nothing to show');
   const events = openLog(dir, 'local:m1');
   events.write('prompt', { text: 'hi' });
   events.end();
-  await new Promise((done) => setTimeout(done, 50));
-  const read = readLog(dir, 'local:m1');
+  const read = await until(() => readLog(dir, 'local:m1'), (r) => Boolean(r && r.events.length >= 1 && r.calls.length >= 1));
   assert.deepEqual(read.calls.map((c) => c.messages[0].content), ['hi']);
   assert.ok(read.file.endsWith('local-m1.jsonl'));
 });
@@ -108,12 +107,11 @@ test('a log not grown since the sizes a reader has is not read again', async () 
   const dir = project();
   const log = openLog(dir, 't2');
   log.write('prompt', { text: 'hello' });
-  await new Promise((done) => setTimeout(done, 50));
-  const first = readLog(dir, 't2');
+  const first = await logOnDisk(dir, 't2', 1);
   assert.deepEqual(readLog(dir, 't2', { unless: { size: first.size, callsSize: first.callsSize } }), { same: true });
   log.write('done', { ok: true });
   log.end();
-  await new Promise((done) => setTimeout(done, 50));
+  await logOnDisk(dir, 't2', 2);
   assert.deepEqual(readLog(dir, 't2', { unless: { size: first.size, callsSize: first.callsSize } }).events.map((e) => e.kind), ['prompt', 'done']);
 });
 
@@ -125,7 +123,7 @@ test('a turn with a log and no saved record is found with its events; a saved on
   write('local:busy1', { turnId: 'local:busy1', sessionId: 's1' });
   write('local:bare1', null);
   saveTurn(dir, turn('local:kept1', '2026-10-12T00:00:00Z'));
-  await new Promise((done) => setTimeout(done, 50));
+  await Promise.all(['local:lost1', 'local:kept1', 'local:busy1', 'local:bare1'].map((id) => logOnDisk(dir, id, 2)));
   const found = unsavedTurns(dir, { except: ['local:busy1'] });
   assert.deepEqual(found.map((f) => f.turnId), ['local:lost1']);
   assert.deepEqual(found[0].events.map((e) => e.kind), ['prompt', 'update']);
