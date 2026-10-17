@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CLIENT_CAPABILITIES, allowOption, codexDeveloperInstructions, legacyOptions, readAgentStatus } from './agents.mjs';
+import { CLIENT_CAPABILITIES, agentShell, allowOption, codexDeveloperInstructions, legacyOptions, powerShellScript, readAgentStatus } from './agents.mjs';
 
 test('an agent that asks: yes for good where it offers that, else yes this once; nothing to say yes with is null', () => {
   const options = [
@@ -55,4 +55,31 @@ test('the chat says it shows notices, so an agent sends its warnings as notices 
   const notices = parsed.session?.notices;
   assert.ok(typeof notices === 'object' && notices !== null && !Array.isArray(notices));
   assert.deepEqual(parsed.elicitation, { form: {} });
+});
+
+test('Claude Code is given of the shell only its PATH and the like: a key or gateway there never stands in for the subscription', () => {
+  const shell = { PATH: '/bin', HTTPS_PROXY: 'http://proxy', CLAUDE_CONFIG_DIR: '/c', LANG: 'zh_CN.UTF-8',
+    ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 't', ANTHROPIC_BASE_URL: 'http://relay', OPENAI_API_KEY: 'o' };
+  const given = agentShell('claude', shell);
+  for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'OPENAI_API_KEY']) assert.equal(given[key], undefined, key);
+  assert.equal(given.HTTPS_PROXY, 'http://proxy');
+  assert.equal(given.CLAUDE_CONFIG_DIR, '/c', 'where its own sign-in is kept');
+  assert.equal(given.LANG, 'zh_CN.UTF-8');
+  assert.equal(agentShell('codex', shell), shell, 'the others have the shell as it is');
+});
+
+test('the chat says it signs in in Terminal, so Claude Code offers its subscription sign-in (ACP terminal auth)', async () => {
+  const { zClientCapabilities } = await import(new URL('../node_modules/@agentclientprotocol/sdk/dist/schema/zod.gen.js', import.meta.url).href);
+  /* the check Claude Code's adapter makes before it offers its terminal sign-ins */
+  assert.equal(zClientCapabilities.parse(CLIENT_CAPABILITIES).auth?.terminal, true);
+});
+
+test('a Windows sign-in is a PowerShell script: each path whole however it is spelled, read as UTF-8', () => {
+  const script = powerShellScript('Claude Code sign-in', 'C:\\Program Files\\OpenFilm\\OpenFilm.exe',
+    ['C:\\Program Files\\OpenFilm\\app.asar\\src\\as-node.mjs', 'D:\\用户\\it\'s\\index.js', '--cli', 'auth', 'login', '--claudeai']);
+  assert.ok(script.startsWith('\ufeff'), 'a BOM: Windows PowerShell reads it as UTF-8');
+  const lines = script.slice(1).split('\r\n');
+  assert.equal(lines[0], "$Host.UI.RawUI.WindowTitle = 'Claude Code sign-in'");
+  assert.equal(lines[1], "& 'C:\\Program Files\\OpenFilm\\OpenFilm.exe' 'C:\\Program Files\\OpenFilm\\app.asar\\src\\as-node.mjs' "
+    + "'D:\\用户\\it''s\\index.js' '--cli' 'auth' 'login' '--claudeai'");
 });

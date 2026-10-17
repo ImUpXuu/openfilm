@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { cancelled, filePickerCommand, folderPickerCommand, startFolder } from './folder-picker.mjs';
 
@@ -70,3 +71,18 @@ test('macOS: the starting folder is made before Finder is asked, and one that is
   assert.ok(lines.indexOf('set startAt to (POSIX file (item 2 of argv)) as alias') < lines.indexOf('tell application "Finder"'));
   assert.ok(!lines.some((l) => l.includes('default location (POSIX file')), 'Finder never makes a path a folder itself');
 });
+
+for (const [kind, picker] of [['folder', folderPickerCommand], ['files', filePickerCommand]]) {
+  test(`Windows: ${kind} paths survive PowerShell output as UTF-8`, { skip: process.platform !== 'win32', timeout: 15_000 }, () => {
+    const paths = ['D:\\音频素材\\承诺 🎵.mp3', 'Z:\\日本語\\música.wav'];
+    const expected = kind === 'folder' ? paths[0] : paths.join('\n');
+    const command = picker('win32', { title: 'Choose' });
+    // Run the command's output setup without opening an interactive dialog. The chosen paths come from the environment.
+    const script = command.args.at(-1).replace(/Add-Type[\s\S]*$/, '[Console]::Out.Write($env:OPENFILM_PICK_TEST_PATHS)');
+    const stdout = execFileSync(command.cmd, [...command.args.slice(0, -1), script], {
+      env: { ...process.env, ...command.env, OPENFILM_PICK_TEST_PATHS: expected },
+      encoding: 'utf8', windowsHide: true, timeout: 10_000,
+    });
+    assert.equal(stdout, expected);
+  });
+}

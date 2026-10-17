@@ -34,6 +34,7 @@
  */
 import * as React from 'react';
 import { isSelectAll as isSelectAllKey, type KeyLike } from '@/lib/select-all-key';
+import { doubleClickAim, keepPress, type Press } from '@/lib/double-press';
 import {
   AlignCenterHorizontal, AlignCenterVertical, AlignEndHorizontal, AlignEndVertical, AlignHorizontalDistributeCenter,
   AlignStartHorizontal, AlignStartVertical, AlignVerticalDistributeCenter, Crop as CropIcon, MessageSquarePlus,
@@ -63,7 +64,7 @@ import {
   positionOf, roundOf, transformOfVisible, visibleFrame, type CropAspect, type Rect,
 } from '@/lib/stage-crop';
 import {
-  alignShift, groupDragged, type GroupDrag, HANDLE_AT, insideBox, insideFrame, movedOffset, pivotCenter, resizedFrame, sameClientRect, sameGuides,
+  alignShift, groupDragged, type GroupDrag, type GroupPull, HANDLE_AT, insideBox, layerInGroup, pullGroup, insideFrame, movedOffset, pivotCenter, resizedFrame, sameClientRect, sameGuides,
   sameLayerGeometry, scaledLayer, turnedLayer, unionRect, type AlignEdge, type ClientBox, type FramePivot,
   type LayerGeometry, type StageFrame,
 } from '@/lib/stage-gesture';
@@ -88,11 +89,15 @@ export type { LayerGeometry } from '@/lib/stage-gesture';
 /** Pulled open this far (stage px, both ways) it is a marquee; less is a click (a shaky hand keeps its click). */
 const MARQUEE_MIN_PX = 8;
 const PICK_BLUE = FRAME_BLUE;
-/** Two presses this close in time are one double-click (the system's own interval is about this). */
-const DOUBLE_PRESS_MS = 500;
 /** Snap this close (screen px: the feel must not change with the picture's scale). */
 const SNAP_PX = 6;
 const NO_GUIDES: readonly MgGuide[] = [];
+/**
+ * A key pressed in the inspector (a menu gone through with the arrows, a field): its own, not a nudge. Heard first by
+ * the nudges (they listen in the capture phase), the arrows moved the layer while a menu was gone through, and the
+ * write took back what the menu showed.
+ */
+const inspectorKey = (target: EventTarget | null): boolean => Boolean((target as Element | null)?.closest?.('[data-film-inspector], [role="listbox"], [role="menu"]'));
 /** A selected layer lost in a redraw is let go after this long without finding it again. */
 const LOST_PICK_GRACE_MS = 1200;
 /** The selection is measured again each time the playhead enters another half second. */
@@ -125,6 +130,8 @@ export interface StageLayer {
   instances?: number;
   kind: StageNodeKind;
   tag: string;
+  /** layers like it in any page: its tag and classes (none: it has no class) */
+  similar?: string;
   label: string;
   text?: { value: string; shape: 'children' | 'prop' | 'value' };
   style: StageElementStyle;
@@ -174,6 +181,11 @@ export interface StageClipEdit {
 export interface FilmStageControl {
   /** Show style keys on a layer before they are kept (`null` takes a key back to the page's own). */
   previewStyle(element: StageElement, patch: StageElementStyle | Record<string, string | number | null>): void;
+  /**
+   * What a layer needs besides `style` so that no other layer moves when it is kept (its place in the page held, as
+   * Figma keeps a restyled layer from moving the others): style to write with it, {} when nothing else moves.
+   */
+  holdStyle(element: StageElement, style: Record<string, string | number | null>, text?: string): Promise<Record<string, string | null>>;
   /** Show a layer's words before they are kept. */
   previewText(element: StageElement, value: string): void;
   /**
@@ -181,6 +193,11 @@ export interface FilmStageControl {
    * box stays put (CSS scales and turns about its unmoved box), and returned with the patch, to be written so.
    */
   previewOverride(element: StageElement, patch: OverrideGeometry, pivot?: FramePivot): Promise<OverrideGeometry>;
+  /**
+   * What is written with an edit of a layer (`patch` null: its override taken away), besides it: for a line with blocks
+   * written inside it (a subtitle inside its title), the overrides that keep those where they were and as they looked.
+   */
+  riders(element: StageElement, patch: OverrideGeometry | null): Promise<{ at: string; n?: number; patch: OverrideGeometry }[]>;
   /** Stop showing what was not kept on the element's clip (an edit was refused). */
   release(element: StageElement): void;
   /** The layer read again (its style after an override was taken away). */
@@ -367,7 +384,8 @@ interface FilmStageSelectProps {
   /** Several layers moved or aligned together: written in one go (one undo step). */
   onTransformLayers?: (list: ReadonlyArray<{ element: StageElement; g: LayerGeometry }>) => void;
   /** A line typed in place: its words written. Refused: a message (the words go back). */
-  onEditTextInline?: (element: StageElement, value: string) => Promise<string | null>;
+  /** `hold`: what kept the other layers in place as the words were typed, written with them. */
+  onEditTextInline?: (element: StageElement, value: string, hold?: Record<string, string | null>) => Promise<string | null>;
   /** Where the thing in hand is now (stage px), for the inspector's X / Y / W / H / turn; reported when it changes. */
   onGeometry?: (geometry: StageGeometry | null) => void;
   /** The context menu's entries for what was right-clicked (see components/stage-menu). */
@@ -588,6 +606,7 @@ function FilmStageSelectImpl({
     clipKind: 'mg',
     ...(layer.text ? { text: { loc: layer.loc, value: layer.text.value, shape: layer.text.shape } } : {}),
     tag: layer.tag,
+    ...(layer.similar ? { similar: layer.similar } : {}),
     style: layer.style,
     declaredStyle: [],
     parents: layer.parents,
@@ -599,8 +618,8 @@ function FilmStageSelectImpl({
   /* ── in-place text editing state (the film runs the text box; it says when it ends) ── */
   const [editingText, setEditingTextState] = React.useState<string | null>(null);
   const textEdit = React.useRef<{ element: StageElement; layer: StageLayer } | null>(null);
-  /** The last press on the picture, in stage px: a double-click is aimed by its first click (see onStageDoubleClick). */
-  const lastPressRef = React.useRef<{ x: number; y: number; at: number } | null>(null);
+  /** The last presses on the picture, in stage px: a double-click is aimed by its first click (see onStageDoubleClick). */
+  const pressesRef = React.useRef<Press[]>([]);
   /* while a line is typed in place the picture takes the pointer (move the caret, select words, click away to blur) */
   const setEditingText = React.useCallback((loc: string | null) => {
     const frame = previewRef.current?.frame?.();
@@ -642,6 +661,10 @@ function FilmStageSelectImpl({
   /* ── several layers moved together ── */
   type MultiDragItem = MultiItem & { base: LayerGeometry; scale: number; now: LayerGeometry };
   const multiDrag = React.useRef<{ x: number; y: number; moved: boolean; rect0: ClientBox; items: MultiDragItem[] } | null>(null);
+  /* several layers scaled or turned by their box's handles (Figma's): each one's center at the press (stage px) */
+  const layersPull = React.useRef<(GroupPull & { x: number; y: number; moved: boolean; box0: ClientBox; items: MultiDragItem[]; centers: { x: number; y: number }[] }) | null>(null);
+  /** The box around several layers while they are turned: the box they had, turned as far. */
+  const [layersTurn, setLayersTurn] = React.useState<{ box: ClientBox; turn: number } | null>(null);
   /* several whole clips selected (on the timeline, or by a marquee): a press on one of them drags them all */
   const clipsDrag = React.useRef<(GroupDrag & {
     x: number; y: number; moved: boolean; items: ClipsDragItem[];
@@ -669,7 +692,7 @@ function FilmStageSelectImpl({
       return p ? { ...it, layer: { ...it.layer, rect: p.rect, frame: p.frame, geo: { ...it.layer.geo, g: items[i]!.now } } } : it;
     });
     setMulti(next);
-    if (!multiDrag.current) setPicked((cur) => (cur ? { ...cur, rect: unionRect(next.map((i) => i.layer.rect)) } : cur));
+    if (!multiDrag.current && !layersPull.current?.moved) setPicked((cur) => (cur ? { ...cur, rect: unionRect(next.map((i) => i.layer.rect)) } : cur));
   }), [ask, setMulti, setPicked]);
   /** Each layer moved by a screen offset (turned back by each one's parents' turn, at each one's scale), shown. */
   const shiftLayers = (items: MultiDragItem[], dxOf: (i: number) => number, dyOf: (i: number) => number) => {
@@ -722,7 +745,7 @@ function FilmStageSelectImpl({
       const fresh = await ask<(StageLayer | null)[]>('layers', {
         refs: many.map((it) => ({ handle: it.layer.handle, clip: it.layer.clip, at: it.layer.at, n: it.layer.n })),
       });
-      if (!fresh || multiRef.current !== many || multiDrag.current) return;
+      if (!fresh || multiRef.current !== many || multiDrag.current || layersPull.current) return;
       const next = many.flatMap((it, i) => {
         const layer = fresh[i];
         if (!layer) return [];
@@ -1016,7 +1039,7 @@ function FilmStageSelectImpl({
     const value = e.value;
     const nextElement = { ...element, ...(element.text ? { text: { ...element.text, value } } : {}) };
     setPicked((cur) => (cur?.element?.loc === element.loc ? { ...cur, element: nextElement } : cur));
-    void onEditTextInline(element, value).then((failed) => {
+    void onEditTextInline(element, value, e.hold).then((failed) => {
       if (!failed) return;
       void ask('release', { clip: layer.clip });
       setPicked((cur) => (cur?.element?.loc === element.loc ? { ...cur, element } : cur));
@@ -1075,6 +1098,7 @@ function FilmStageSelectImpl({
       }
       /* the arrows are the playhead's unless the picture has the keyboard (arrowsMove) */
       if (e.key.startsWith('Arrow') && !arrowsMoveRef.current) return;
+      if (e.key.startsWith('Arrow') && inspectorKey(e.target)) return;
       if (e.key.startsWith('Arrow') && multiRef.current && onTransformLayers && !multiRef.current.some((it) => lockedClip(it.element.clipLoc)) && !e.metaKey && !e.ctrlKey && !e.altKey) {
         if (!typingNow()) {
           e.preventDefault();
@@ -1312,6 +1336,10 @@ function FilmStageSelectImpl({
         const at = named(element);
         if (at) void ask('tweak', { ...at, patch: { style: clean(patch as Record<string, string | number | null | undefined>) } }).then(syncGeomSoon);
       },
+      async holdStyle(element, style, text) {
+        const at = named(element);
+        return (at ? await ask<Record<string, string | null>>('hold', { ...at, style: clean(style), ...(text != null ? { text } : {}) }) : null) ?? {};
+      },
       previewText(element, value) {
         const at = named(element);
         if (at) void ask('tweak', { ...at, patch: { text: value } }).then(syncGeomSoon);
@@ -1329,6 +1357,10 @@ function FilmStageSelectImpl({
         await ask('tweak', { ...at, patch: geometry });
         syncGeomSoon();
         return patch;
+      },
+      async riders(element, patch) {
+        const at = named(element);
+        return (at ? await ask<{ at: string; n?: number; patch: OverrideGeometry }[]>('riders', { ...at, patch }) : null) ?? [];
       },
       release(element) {
         if (element.clipId) void ask('release', { clip: element.clipId }).then(syncGeomSoon);
@@ -1601,7 +1633,7 @@ function FilmStageSelectImpl({
     const onKey = (e: KeyboardEvent) => {
       if (!e.key.startsWith('Arrow') || !arrowsMoveRef.current || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
       const el = e.target as HTMLElement | null;
-      if (inHostPanel(el) || el?.closest('input, textarea, select, [contenteditable="true"], [data-timeline]')) return;
+      if (inHostPanel(el) || inspectorKey(el) || el?.closest('input, textarea, select, [contenteditable="true"], [data-timeline]')) return;
       nudgeGroupRef.current(e);
     };
     window.addEventListener('keydown', onKey, true);
@@ -1777,7 +1809,7 @@ function FilmStageSelectImpl({
   }), [ask, stage]);
   /** Measured only with nothing being dragged, drawn or cropped. */
   const measureAt = (p: { x: number; y: number } | null) => {
-    const busy = gestureRef.current || layerDrag.current || multiDrag.current || draftRef.current || cropRef.current || textEdit.current;
+    const busy = gestureRef.current || layerDrag.current || multiDrag.current || layersPull.current || draftRef.current || cropRef.current || textEdit.current;
     if (!p || !pickedRef.current || busy) {
       altHeld.current = false;
       setMeasure(null);
@@ -1924,8 +1956,8 @@ function FilmStageSelectImpl({
     const token = ++pressSeq.current;
     /* where the double-click began, in the film's own pixels: its first click can open the inspector, and the picture
        shrinks under the hand before the second — taken where the second landed on screen, it typed in another line */
-    const first = lastPressRef.current;
-    const at = first && e.timeStamp - first.at < DOUBLE_PRESS_MS ? { x: first.x, y: first.y } : { x: p.x / vs, y: p.y / vs };
+    const first = doubleClickAim(pressesRef.current, e.timeStamp);
+    const at = first ? { x: first.x, y: first.y } : { x: p.x / vs, y: p.y / vs };
     const inside = held && insideBox(held.rect, at.x, at.y);
     /* cropping, a double-click keeps the crop (as in Figma); on the video or still in hand, it starts one */
     if (cropRef.current) { finishCrop(true); return; }
@@ -2134,6 +2166,16 @@ function FilmStageSelectImpl({
         clipsPlace.push(cd.items.map((it) => ({ clip: it.id, box: null })));
         setLinkedMarks((marks) => marks.map((m) => cd.items.find((it) => it.loc === m.loc) ? { ...m, t: cd.items.find((it) => it.loc === m.loc)!.t0 } : m));
       });
+      return;
+    }
+    const lp = layersPull.current;
+    if (lp) {
+      layersPull.current = null;
+      e.stopPropagation();
+      setDragging(false);
+      setLayersTurn(null);
+      if (!lp.moved) return;
+      void multiPaint.idle().then(() => onTransformLayers?.(lp.items.map((it) => ({ element: it.element, g: it.now }))));
       return;
     }
     const md = multiDrag.current;
@@ -2442,8 +2484,7 @@ function FilmStageSelectImpl({
       if (!outside) onPause?.();
       const p = local(e);
       /* the first press of a double-click is kept: the second one lands where the picture has moved to */
-      const prev = lastPressRef.current;
-      if (!prev || e.timeStamp - prev.at > DOUBLE_PRESS_MS) lastPressRef.current = { x: p.x / viewScaleNow(), y: p.y / viewScaleNow(), at: e.timeStamp };
+      pressesRef.current = keepPress(pressesRef.current, { x: p.x / viewScaleNow(), y: p.y / viewScaleNow(), at: e.timeStamp });
       /* ⌘ held: a box to point at in the chat, whatever is under the press (nothing is selected or moved) */
       if (onRegion && regionKeyHeld(e)) {
         /* a box for the chat is meant at once, wherever it starts */
@@ -2572,9 +2613,31 @@ function FilmStageSelectImpl({
         currentTarget.setPointerCapture(pointerId);
         return;
       }
-      /* several selected: a press inside their box drags them all (Shift adds / takes away instead) */
+      /* several selected: a press inside their box drags them all (Shift adds / takes away instead); its handles scale
+         them or turn them together, as Figma does a selection */
       const many = multiRef.current;
       const held0 = pickedRef.current;
+      const pullKind = groupHit?.getAttribute('data-group-kind');
+      if (many && held0 && onTransformLayers && !many.some((it) => lockedClip(it.element.clipLoc)) && (pullKind === 'scale' || pullKind === 'stretch' || pullKind === 'rotate')) {
+        const handle = pullKind === 'rotate' ? null : groupHit!.getAttribute('data-group-handle');
+        const g = held0.rect;
+        const mid = { x: g.left + g.width / 2, y: g.top + g.height / 2 };
+        const at = (h: string, far: boolean) => ({
+          x: h.includes('e') || h.includes('w') ? g.left + (h.includes('e') !== far ? g.width : 0) : mid.x,
+          y: h.includes('n') || h.includes('s') ? g.top + (h.includes('s') !== far ? g.height : 0) : mid.y,
+        });
+        const items = multiItemsNow();
+        layersPull.current = {
+          kind: pullKind === 'rotate' ? 'rotate' : 'scale', handle,
+          x: p.x, y: p.y, moved: false, items, centers: items.map((it) => ({ x: it.layer.frame.cx, y: it.layer.frame.cy })),
+          dx: 0, dy: 0, kx: 1, ky: 1, turn: 0, box0: g,
+          anchor: pullKind === 'rotate' ? mid : handle ? at(handle, true) : mid,
+          from: handle ? at(handle, false) : { x: 0, y: 0 },
+          a0: Math.atan2(stagePt.y - mid.y, stagePt.x - mid.x),
+        };
+        currentTarget.setPointerCapture(pointerId);
+        return;
+      }
       if (many && held0 && !e.shiftKey && onTransformLayers && !many.some((it) => lockedClip(it.element.clipLoc)) && insideBox(scaleBox(held0.rect, vs), p.x, p.y)) {
         multiDrag.current = { x: p.x, y: p.y, moved: false, rect0: held0.rect, items: multiItemsNow() };
         currentTarget.setPointerCapture(pointerId);
@@ -2630,13 +2693,14 @@ function FilmStageSelectImpl({
           return;
         }
       }
-      /* about to draw: the previous selection goes first (two boxes on screen would read as two selected), and the
-         timeline's with it; but a press on a clip selected there (several: no handles) is not a press elsewhere */
+      /* about to draw: the previous selection's box goes first (two boxes on screen would read as two selected); the
+         inspector and the timeline keep it until the release says what is selected instead (or nothing), so the
+         inspector goes from one layer to the next, not through the film's settings. A press on a clip selected on
+         the timeline (several: no handles) is not a press elsewhere */
       cycleFrom.current = e.altKey ? pickedRef.current?.layer?.handle ?? null : null;
       pressedFrom.current = pickedRef.current?.layer?.handle ?? null;
       const clearPrevious = () => {
         dropPick();
-        onSelectElement?.(null);
         setHover(null);
       };
       const linked = linkedLocs ?? [];
@@ -2701,13 +2765,13 @@ function FilmStageSelectImpl({
             setRegionDraft(regionDraftRef.current);
             return;
           }
-          const held = regionKeyHeld(e) && !gestureRef.current && !layerDrag.current && !multiDrag.current && !draftRef.current;
+          const held = regionKeyHeld(e) && !gestureRef.current && !layerDrag.current && !multiDrag.current && !layersPull.current && !draftRef.current;
           setModAt(held ? p : null);
           /* nothing is hovered while ⌘ is held: what a box takes in is not one layer */
           if (held) { setHover(null); return; }
         }
         /* Alt held with something in hand: measuring, not hovering */
-        if (e.altKey && pickedRef.current && !gestureRef.current && !layerDrag.current && !multiDrag.current && !draftRef.current && !cropRef.current) {
+        if (e.altKey && pickedRef.current && !gestureRef.current && !layerDrag.current && !multiDrag.current && !layersPull.current && !draftRef.current && !cropRef.current) {
           measureAt(local(e));
           setHover(null);
           return;
@@ -2723,24 +2787,36 @@ function FilmStageSelectImpl({
           if (d.kind === 'move') {
             d.dx = (p.x - d.x) / vs;
             d.dy = (p.y - d.y) / vs;
-          } else if (d.kind === 'rotate') {
-            /* Shift: in steps of 15°, as a single clip turns */
-            const turn = ((Math.atan2(at.y - d.anchor.y, at.x - d.anchor.x) - d.a0) * 180) / Math.PI;
-            d.turn = e.shiftKey ? Math.round(turn / 15) * 15 : turn;
-            setGroupTurn({ box: d.box0, turn: d.turn });
           } else {
-            const ux = d.from.x - d.anchor.x, uy = d.from.y - d.anchor.y;
-            const along = (v: number, u: number, a: number) => Math.max(0.02, (v - a) / (Math.abs(u) > 1e-6 ? u : 1e-6));
-            if (d.handle && d.handle.length === 2) {
-              /* a corner: along the frame's diagonal, both ways alike (a page is never stretched) */
-              const k = Math.max(0.02, ((at.x - d.anchor.x) * ux + (at.y - d.anchor.y) * uy) / Math.max(1e-6, ux * ux + uy * uy));
-              d.kx = d.ky = k;
-            } else if (d.handle === 'e' || d.handle === 'w') d.kx = along(at.x, ux, d.anchor.x);
-            else d.ky = along(at.y, uy, d.anchor.y);
+            /* a corner scales both ways alike (a page is never stretched); Shift turns in steps of 15° */
+            pullGroup(d, at, e.shiftKey);
+            if (d.kind === 'rotate') setGroupTurn({ box: d.box0, turn: d.turn });
           }
           const moved = d.items.map((it) => ({ loc: it.loc, box: it.box, t: groupDragged(d, it.t0, it.box) }));
           setClipsMoved(moved);
           clipsPlace.push(d.items.map((it, i) => ({ clip: it.id, box: compactBox(moved[i]!.t, it.box) })));
+          return;
+        }
+        if (layersPull.current) {
+          const d = layersPull.current;
+          const p = local(e);
+          const vs = viewScaleNow();
+          if (!d.moved && Math.hypot(p.x - d.x, p.y - d.y) < 4) return;
+          if (!d.moved) { d.moved = true; setDragging(true); setHover(null); }
+          pullGroup(d, { x: p.x / vs, y: p.y / vs }, e.shiftKey);
+          if (d.kind === 'rotate') setLayersTurn({ box: d.box0, turn: d.turn });
+          /* each one's center goes with the box, each one scaled or turned as much */
+          d.items.forEach((it, i) => {
+            const m = layerInGroup(d, d.centers[i]!, it.base);
+            it.now = { ...it.base, t: movedOffset(it.base, m.dx * vs, m.dy * vs, it.layer.geo.parentR, it.scale), s: m.s, r: m.r };
+          });
+          multiPaint.push(d.items.map((it) => ({ ...it })));
+          /* scaled: the box goes with the hand (turned, it is drawn turned, layersTurn) */
+          if (d.kind === 'scale') {
+            const b = d.box0;
+            const left = d.anchor.x + (b.left - d.anchor.x) * d.kx, top = d.anchor.y + (b.top - d.anchor.y) * d.ky;
+            setPicked((cur) => (cur ? { ...cur, rect: { left, top, width: b.width * d.kx, height: b.height * d.ky } } : cur));
+          }
           return;
         }
         if (multiDrag.current) {
@@ -2883,7 +2959,20 @@ function FilmStageSelectImpl({
               maskBox ? outline(layerFrame) : (
                 <StageTransformFrame frame={layerFrame} scope="layer" edges moving={dragging} label={sizeLabel(layerFrame)} bounds={stageBounds} />
               )
-            ) : (
+            ) : multi && onTransformLayers && !multi.some((it) => lockedClip(it.element.clipLoc)) ? (() => {
+              /* several layers: their box's handles scale and turn them together (layersPull) */
+              const g = layersTurn?.box ?? picked.rect;
+              return (
+                <StageTransformFrame
+                  frame={{ cx: (g.left + g.width / 2) * vsNow, cy: (g.top + g.height / 2) * vsNow, w: g.width * vsNow, h: g.height * vsNow, r: layersTurn?.turn ?? 0 }}
+                  scope="group"
+                  edges
+                  moving={dragging}
+                  label={layersTurn ? `${Math.round(layersTurn.turn)}°` : `${Math.round(g.width)} × ${Math.round(g.height)}`}
+                  bounds={stageBounds}
+                />
+              );
+            })() : (
               /* what cannot be moved (a locked layer, a group, a clip without its size yet): its drawn shape */
               <Box
                 rect={scaleBox(picked.layer?.rect ?? picked.rect, vsNow)}

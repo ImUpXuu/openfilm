@@ -379,11 +379,11 @@ test('openfilm get: what can be got here, connected, partly or not at all; wrong
     /* nothing connected: no verbs, what to do instead */
     rmSync(providersFile());
     const nothing = get(scratch);
-    assert.equal(nothing.status, 0);
+    assert.equal(nothing.status, 0, nothing.stderr);
     assert.equal(nothing.stdout, 'Nothing is connected for media here: each kind works only once the person connects a service that makes it (below). '
       + 'Until then, make sound and pictures in code, or use a service the person has a key for (with its API docs), and save them under assets/. '
       + `\`openfilm get <what> --help\` shows what one kind takes (${media.join(', ')}).\n\n${services()}\n`);
-    assert.match(services(), /^Media services, each used with the person's own key: Azure Speech \(voice-over\), Brave Search \(web search\), ElevenLabs \(voice-over, sound effects, music, transcripts\), fal\.ai \(images, video, music, sound effects\), .*, Tavily \(web search\)\. In Studio, the OpenFilm logo at the top left opens Settings/);
+    assert.match(services(), /^Media services, each used with the person's own key: Azure Speech \(voice-over\), Brave Search \(web search\), Doubao \(transcripts\), ElevenLabs \(voice-over, sound effects, music, transcripts\), fal\.ai \(images, video, music, sound effects\), .*, Tavily \(web search\)\. In Studio, the OpenFilm logo at the top left opens Settings/);
 
     /* partly: what is connected, then one line for the rest with the services that make each, then the services there
        are; never who makes what is connected */
@@ -424,4 +424,39 @@ test('nothing connected: no verbs, and a note naming only what the services make
   assert.doesNotMatch(note, /account/i);
   /* one kind: which services make it, and where the person connects one */
   assert.equal((await catalog('video')).note, `Not connected here: ${unconnected('video')}. ${CONNECT_ONE}`);
+});
+
+test('call: the person\'s own services are listed with what they do, and reached with their key', async () => {
+  assert.equal((await catalog()).verbs.some((v) => v.verb === 'call'), false, 'listed only once there is one');
+  assert.match((await catalog('call')).note, /added no services of their own/);
+  await changeSettings((s) => { s.custom = [{ id: 'whisper', name: 'Whisper', url: `${base}/local`, key: 'local-key-1234', auth: 'Authorization: Bearer {key}', note: 'Transcribes, OpenAI style, word timings' }]; });
+  const call = (await catalog()).verbs.find((v) => v.verb === 'call');
+  assert.match(call.help, /--service whisper: Whisper at http:\/\/127\.0\.0\.1:\d+\/local\. Transcribes, OpenAI style, word timings/);
+  assert.equal(call.help.includes('local-key-1234'), false);
+  const root = project();
+  mkdirSync(join(root, 'assets'), { recursive: true });
+  writeFileSync(join(root, 'assets/vo.wav'), 'RIFF');
+  refuse = () => [200, { text: 'hi', words: [{ word: 'hi', start: 0, end: 0.2 }] }];
+  const said = await runGet(root, 'call', { service: 'whisper', path: '/v1/audio/transcriptions', file: 'file=assets/vo.wav', form: ['model=whisper-1'] });
+  assert.match(said, /^Whisper answered 200 \(application\/json\):/);
+  assert.equal(calls.at(-1).path, '/local/v1/audio/transcriptions');
+  assert.equal(calls.at(-1).headers.authorization, 'Bearer local-key-1234');
+  await assert.rejects(runGet(root, 'call', { service: 'nope' }), (e) => e.code === 2 && /There is no service nope: there is whisper/.test(e.message));
+  await assert.rejects(runGet(root, 'call', { service: 'whisper', path: '//evil.com/' }), (e) => e.code === 2);
+});
+
+test('a voice-over spoken again without word timings: the last take\'s transcript goes, and the receipt says there is none', async () => {
+  process.env.OPENFILM_TRASH_DIR ??= mkdtempSync(join(tmpdir(), 'of-trash-'));
+  const root = project();
+  mkdirSync(join(root, 'assets/audio/vo'), { recursive: true });
+  writeFileSync(join(root, 'assets/audio/vo/intro.wav'), 'old take');
+  writeFileSync(join(root, 'assets/audio/vo/intro.vtt'), 'WEBVTT\n\n00:00.000 --> 00:09.000\nThe old take, spoken slower\n');
+  /* a WAV of a second of silence, as OpenAI answers */
+  const wav = Buffer.alloc(44 + 32000);
+  wav.write('RIFF', 0); wav.writeUInt32LE(36 + 32000, 4); wav.write('WAVEfmt ', 8); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(16000, 24); wav.writeUInt32LE(32000, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(32000, 40);
+  refuse = (call) => (call.path === '/v1/audio/speech' ? [200, wav] : [404, {}]);
+  const said = await runGet(root, 'tts', { text: 'Hello', voice: 'alloy', out: 'intro' }, { via: 'openai' });
+  assert.equal(existsSync(join(root, 'assets/audio/vo/intro.vtt')), false);
+  assert.match(said, /"transcript": "none: the service does not time words/);
 });

@@ -17,7 +17,7 @@
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { basename, dirname, extname, join } from 'node:path';
 import { writeAtomic } from './atomic.mjs';
-import { inProject, inside } from './files.mjs';
+import { inProject, inside, trashFile } from './files.mjs';
 import { alignTranslation, replacePiece, segmentLine } from './subtitle-segments.mjs';
 
 /** @typedef {{ token: string, startSec: number, endSec?: number }} Word */
@@ -202,6 +202,19 @@ export async function transcriptIsCurrent(root, src) {
   if (!file || !vtt) return false;
   const [media, words] = await Promise.all([stat(file).catch(() => null), stat(vtt).catch(() => null)]);
   return Boolean(media && words && words.mtimeMs >= media.mtimeMs);
+}
+
+/**
+ * A sound or video made again in place (a voice-over spoken again under its name, a service's answer saved over the
+ * last one): its transcript and translations are the old take's, and go to the trash. Subtitles are never timed by
+ * another take's words; when the new one came with timed words, its own transcript is written after.
+ * @param {string} root @param {string} src
+ */
+export async function dropTranscripts(root, src) {
+  for (const rel of [transcriptPath(src), ...(await translationsOf(root, src)).map((language) => transcriptPath(src, language))]) {
+    const abs = inProject(root, rel);
+    if (abs && await stat(abs).catch(() => null)) await trashFile(root, rel).catch(() => {});
+  }
 }
 
 /** The languages `src` has a translation in (`name.<language>.vtt` beside it). @param {string} root @param {string} src */
@@ -455,6 +468,7 @@ export function spokenLines(source, words, durMs) {
       text: raw.trim(),
       /* a piece with no matched word (all digits or marks) follows the one before */
       startMs: inPiece[0] ? Math.round(inPiece[0].startSec * 1000) : 0,
+      spokenUntilMs: inPiece.reduce((end, m) => Math.max(end, Math.round((m.endSec ?? m.startSec) * 1000)), 0),
       marks: inPiece.map((m) => ({ index: m.index - piece.from - lead, startMs: Math.round(m.startSec * 1000) })),
     };
   });
@@ -463,13 +477,13 @@ export function spokenLines(source, words, durMs) {
   }
   return started.map((one, i) => {
     /* a line stays up until the next one starts (a gap would blank the line being read), the last until the source
-       ends, unless that is a long silence: then about as long as it takes to say, plus GAP_MS */
+       ends, unless that is a long silence: then through its words or the estimated speaking time, plus GAP_MS */
     const until = started[i + 1]?.startMs ?? total ?? Infinity;
     const spoken = Math.max(500, cells(one.text) * FALLBACK_MS_PER_CELL);
     return {
       text: one.text,
       startMs: one.startMs,
-      endMs: Math.min(until, one.startMs + spoken + GAP_MS),
+      endMs: Math.min(until, Math.max(one.startMs + spoken, one.spokenUntilMs) + GAP_MS),
       ...(one.marks.length ? { marks: one.marks } : {}),
     };
   }).filter((l) => l.endMs > l.startMs);

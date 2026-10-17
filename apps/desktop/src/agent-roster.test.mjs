@@ -43,7 +43,7 @@ test('a key is kept only once the service took it with a picture; a model that c
   assert.match((await r.configureByok({ format: 'chat', baseUrl: 'https://api.deepseek.com/v1', model: 'm', key: 'bad' })).error, /did not accept/);
   answer = { status: 200, body: { choices: [] } };
   assert.deepEqual(await r.configureByok({ format: 'chat', baseUrl: 'https://api.deepseek.com/v1/', model: 'vision', key: 'sk-good-9876' }), { ok: true });
-  assert.deepEqual(readChoices(dir).byok, { format: 'chat', baseUrl: 'https://api.deepseek.com/v1', model: 'vision', models: ['vision'], last4: '9876' });
+  assert.deepEqual(readChoices(dir).byok, { format: 'chat', baseUrl: 'https://api.deepseek.com/v1', model: 'vision', models: ['vision'], efforts: { vision: { levels: ['auto'], effort: 'auto' } }, last4: '9876' });
   assert.equal(readChoices(dir).shown.byok, true, 'set up: shown in the chat');
   assert.equal(readFileSync(join(dir, 'byok.key'), 'utf8'), 'sealed:sk-good-9876', 'the key sealed');
   assert.equal(JSON.stringify(readChoices(dir)).includes('sk-good'), false, 'never in the choices file');
@@ -98,10 +98,21 @@ test('a key may name several models: each is asked with a picture, the first is 
   assert.deepEqual(r.list().find((a) => a.id === 'byok').byok.models, ['vision', 'big']);
 });
 
+test('each model keeps the efforts the person gave it and the one it starts on; one given none offers Auto alone', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'of-roster-'));
+  const r = roster(dir, async () => new Response('{}', { status: 200 }));
+  assert.deepEqual(await r.configureByok({ format: 'responses', models: ['gpt-a', 'mine'], key: 'sk-1234',
+    efforts: { 'gpt-a': { levels: ['high', 'auto', 'medium', 'turbo'], effort: 'medium' }, mine: { levels: [], effort: 'high' }, gone: { levels: ['max'] } } }), { ok: true });
+  const efforts = { 'gpt-a': { levels: ['auto', 'medium', 'high'], effort: 'medium' }, mine: { levels: ['auto'], effort: 'auto' } };
+  assert.deepEqual(readChoices(dir).byok.efforts, efforts, 'known efforts in order; nothing for a model not named');
+  assert.deepEqual(r.harness('byok').efforts, efforts);
+  assert.deepEqual(r.list().find((a) => a.id === 'byok').byok.efforts, efforts);
+});
+
 test('a key kept with one model, before there could be several, reads as that one', () => {
   const dir = mkdtempSync(join(tmpdir(), 'of-roster-'));
   writeFileSync(join(dir, 'agents.json'), JSON.stringify({ byok: { format: 'responses', baseUrl: 'https://api.openai.com/v1', model: 'gpt-x', last4: 'abcd' } }));
-  assert.deepEqual(readChoices(dir).byok, { format: 'responses', baseUrl: 'https://api.openai.com/v1', model: 'gpt-x', models: ['gpt-x'], last4: 'abcd' });
+  assert.deepEqual(readChoices(dir).byok, { format: 'responses', baseUrl: 'https://api.openai.com/v1', model: 'gpt-x', models: ['gpt-x'], efforts: { 'gpt-x': { levels: ['auto'], effort: 'auto' } }, last4: 'abcd' });
 });
 
 test("Codex and Claude Code are shown in the chat from the start, the person's other agents once connected or switched on", async () => {
@@ -167,6 +178,8 @@ test('disconnecting only stops OpenFilm using an agent; connecting again uses th
     closeSessions: (id) => closed.push(id),
   });
   await r.refresh();
+  assert.equal(r.list().find((a) => a.id === 'claude').status, 'off', 'Claude Code waits for the person to connect it');
+  assert.deepEqual(await r.connect('claude'), { ok: true });
   assert.deepEqual(r.list().find((a) => a.id === 'claude').account, { method: 'claude.ai', email: 'a@b.test' });
   r.disconnect('claude');
   assert.equal(r.list().find((a) => a.id === 'claude').status, 'off');
@@ -176,5 +189,12 @@ test('disconnecting only stops OpenFilm using an agent; connecting again uses th
   const claude = r.list().find((a) => a.id === 'claude');
   assert.equal(claude.status, 'ready');
   assert.equal(claude.account.email, 'c@d.test');
-  assert.deepEqual(closed, ['claude', 'claude'], 'its sessions closed both times: none goes on with the old account');
+  assert.deepEqual(closed, ['claude', 'claude', 'claude'], 'its sessions closed each time: none goes on with the old account');
+});
+
+test('Codex is connected from the start, Claude Code once the person connects it; a choice kept stays as it is', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'of-roster-'));
+  assert.deepEqual(readChoices(dir).disconnected, ['claude']);
+  writeFileSync(join(dir, 'agents.json'), JSON.stringify({ disconnected: [] }));
+  assert.deepEqual(readChoices(dir).disconnected, [], 'connected before: still connected');
 });

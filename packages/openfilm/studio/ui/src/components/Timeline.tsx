@@ -18,6 +18,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  Film,
   ListRestart,
   Lock,
   LockOpen,
@@ -55,6 +56,7 @@ import {
 } from 'lucide-react';
 import { useT } from '@/i18n';
 import { shortcutHint } from '@/lib/shortcut-hint';
+import { ownTrackHeight } from '@/lib/track-heights';
 import type { Op } from '@/api';
 import type { ClipEdit } from '@/lib/film-clip-edits';
 import { laneOfBlock } from '@/lib/timeline-clipboard';
@@ -144,6 +146,7 @@ import type { PlaybackClock } from './LiveTime';
 import { CaptionsIcon } from './player-controls/controls-bar';
 import { isTypingTarget } from './typing-target';
 import { Popover } from './Popover';
+import { MarkerGlyph } from './TimelineMarkers';
 import { SUBTITLE_ROW_H, SubtitleRow, SubtitleRowHead, useSubtitleRowShown, type SubtitleRowHandle, type SubtitleRowSpec } from './SubtitleRow';
 import { SoloButton, TrackResizeHandle } from './timeline-head-extras';
 import { clipAtPoint, markReplaceTarget } from './replace-drop';
@@ -178,6 +181,22 @@ const PLAYHEAD_GRAB_PX = 4;
 /* the range bar's hit height (the visible bar is thinner, see .tl-range-thumb; 5 px could hardly be hit) */
 const H_SCROLL_H = 10;
 const RULER_H = 20;
+/** The markers' row under the ruler (only while there are markers). */
+const MARKER_ROW_H = 16;
+
+/** A marker's line through the timeline: where, in its color; `held` while it is dragged (else hovered, fainter). */
+export interface MarkerGuide { ms: number; color: string; held: boolean }
+
+/** What the markers' row is drawn with (Timeline's `markerLane`). */
+export interface MarkerLaneView {
+  pxPerMs: number;
+  /** the row's length, px */
+  widthPx: number;
+  /** a time a marker is dragged to, snapped as clips are (when snapping is on) */
+  snap: (ms: number) => number;
+  /** the line through the timeline where a marker is hovered or dragged (null: none) */
+  guide: (g: MarkerGuide | null) => void;
+}
 /**
  * Row heights. A clip is three layers — info strip (name + length), preview band (thumbnails / waveform), audio band —
  * and a low waveform shows nothing, while "did this cut land mid-word" can only be seen on it.
@@ -233,19 +252,21 @@ const TL = {
 
 function laneTone(track: TimelineTrack, selected: boolean): string {
   if (track.hidden) return TL.head;
-  return selected ? TL.laneOn : TL.lane;
+  const tone = selected ? TL.laneOn : TL.lane;
+  /* the main track: a band of its own, a shade toward the text (lighter in the dark, darker in the light) */
+  return track.main ? `color-mix(in srgb, ${tone} 93%, var(--tl-text))` : tone;
 }
 
-/** A row's height: the person's for its track (lib/track-heights), else the timeline's own for its kind. */
-function rowH(track: Pick<TimelineTrack, 'kind' | 'height'>): number {
-  return track.height ?? TRACK_H[track.kind];
+/** A row's height: the person's for its track (lib/track-heights), else the timeline's own (the main track taller). */
+function rowH(track: Pick<TimelineTrack, 'kind' | 'height' | 'main'>): number {
+  return track.height ?? ownTrackHeight(track);
 }
 
 /**
  * The height that shows every row (toolbar + ruler + rows + padding + range bar). The editor uses it for the
  * timeline's default height.
  */
-export function timelineFitHeight(tracks: readonly Pick<TimelineTrack, 'kind' | 'height'>[]): number {
+export function timelineFitHeight(tracks: readonly Pick<TimelineTrack, 'kind' | 'height' | 'main'>[]): number {
   const lanes = tracks.reduce((h, tr) => h + rowH(tr) + GAP, 0);
   return TOOLBAR_H + RULER_H + lanes + GAP + 2 * TL_VPAD + H_SCROLL_H;
 }
@@ -535,6 +556,12 @@ export interface TimelineProps {
    * at the playhead (`atMs`) for a point picked on the ruler. Without it the bar has no such button.
    */
   onReferSelection?: (what: { blocks: readonly TimelineBlock[]; range: FilmRange | null; atMs: number | null }) => void;
+  /**
+   * With the app's chat: the ruler points at time for it. A click there is that moment, a drag that span, each one
+   * a pill in the chat; the playhead does not go there (it is dragged by its knob, or a click in the tracks' empty
+   * space). Without it the ruler moves the playhead.
+   */
+  onReferRuler?: (what: { atMs: number } | { range: FilmRange }) => void;
   /** The bar's Duplicate: copies of the clips right after them. */
   onDuplicate?: (blocks: readonly TimelineBlock[]) => Promise<string | null>;
   /** The bar's Play range: from the range's start, stopping at its end. */
@@ -646,12 +673,14 @@ export interface TimelineProps {
   subtitleRow?: SubtitleRowSpec;
   /** Solo (Studio's playback only): the tracks soloed (film.html indexes), and a click on a head's S (⌥: alone). */
   solo?: { tracks: ReadonlySet<number>; onToggle: (docIndex: number, only: boolean) => void };
-  /** Drawn on the ruler, scrolling with it (the markers, components/TimelineMarkers). */
-  rulerOverlay?: (pxPerMs: number) => React.ReactNode;
+  /** The markers' row under the ruler (under the subtitle row when it shows), while there are any. */
+  markerLane?: { shown: boolean; render: (lane: MarkerLaneView) => React.ReactNode };
+  /** The toolbar's Add marker (left of split); M does the same. */
+  onAddMarker?: () => void;
+  /** The ruler's own right-click menu, at a moment (film ms): adding a marker there. */
+  rulerMenu?: (atMs: number) => ContextMenuEntry[];
   /** Drawn on each row, over its clips (the clips' markers). */
   trackOverlay?: (track: TimelineTrack, pxPerMs: number) => React.ReactNode;
-  /** More buttons in the toolbar, before the zoom (the markers' list). */
-  toolbarExtra?: React.ReactNode;
   /** More times a drag snaps to (the markers), ms. */
   snapPointsMs?: readonly number[];
   /** A track's head edge dragged (a height, `done` at the end) or double-clicked (null: its own height). */
@@ -885,6 +914,7 @@ export const Timeline = React.memo(function Timeline({
   rangeRef,
   selectionBar = false,
   onReferSelection,
+  onReferRuler,
   onDuplicate,
   onPlayRange,
   totalMs,
@@ -923,9 +953,10 @@ export const Timeline = React.memo(function Timeline({
   onRenameTrack,
   subtitleRow,
   solo,
-  rulerOverlay,
+  markerLane,
+  onAddMarker,
+  rulerMenu,
   trackOverlay,
-  toolbarExtra,
   snapPointsMs,
   onResizeTrack,
   onReplaceDrop,
@@ -1262,6 +1293,15 @@ export const Timeline = React.memo(function Timeline({
   const subRowRef = React.useRef<SubtitleRowHandle | null>(null);
   const subRowShown = Boolean(subtitleRow) && subRowOn && hasLanes;
   const subRowH = subRowShown ? SUBTITLE_ROW_H : 0;
+  const markerRowH = markerLane?.shown ? MARKER_ROW_H : 0;
+  /* a marker hovered or dragged: its line through the whole timeline */
+  const [markerGuide, setMarkerGuide] = React.useState<MarkerGuide | null>(null);
+  React.useEffect(() => { if (!markerRowH) setMarkerGuide(null); }, [markerRowH]);
+  /* a marker dragged snaps as a clip does (to clip edges and the playhead), while snapping is on */
+  const snapMarker = React.useCallback((ms: number) => {
+    if (!snap) return ms;
+    return snapMs(ms, snapTargetsFor(allBlocks, null, timeMsRef.current), pxPerMs).ms;
+  }, [snap, allBlocks, pxPerMs]);
   const drag = useBlockDrag({
     allBlocks,
     lanes: tracks,
@@ -1607,6 +1647,53 @@ export const Timeline = React.memo(function Timeline({
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', up);
   }, [playable, msAtClientX, laneAtY, contentY, tracks, selectOne, onScrubCommit, warmPlayheadAt, setSelected, withLinked, onEditOps, pxPerMs]);
+
+  /*
+   * With the app's chat, the ruler points at time for it (onReferRuler): a click there is that moment, a drag that
+   * span, drawn as it is pulled. A press on the playhead (its knob, ±4 px) still drags it.
+   */
+  const [referDraft, setReferDraft] = React.useState<FilmRange | null>(null);
+  /* where the pointer is on the ruler (film ms), shown as the moment a click would refer; not near the playhead (its
+     knob is dragged there) */
+  const [rulerHoverMs, setRulerHoverMs] = React.useState<number | null>(null);
+  /* the ruler's own menu, open (rulerMenu) */
+  const [rulerMenuAt, setRulerMenuAt] = React.useState<{ x: number; y: number; items: ContextMenuEntry[] } | null>(null);
+  const hoverRuler = React.useCallback((e: React.PointerEvent) => {
+    if (!onReferRuler || !playable) return;
+    /* on a marker's pin: the pin is what a click there is about */
+    setRulerHoverMs(playheadGapPx(e.clientX, timeMsRef.current) > PLAYHEAD_GRAB_PX ? Math.max(0, Math.min(totalMs, msAtClientX(e.clientX))) : null);
+  }, [onReferRuler, playable, playheadGapPx, totalMs, msAtClientX]);
+  const startRefer = React.useCallback((e: React.PointerEvent) => {
+    if (e.button !== 0 || !playable || !onReferRuler) return;
+    e.preventDefault();
+    const startX = e.clientX;
+    const at = (clientX: number) => Math.max(0, Math.min(totalMs, msAtClientX(clientX)));
+    const fromMs = at(e.clientX);
+    let dragged = false;
+    let atX = e.clientX;
+    let raf = 0;
+    const flush = (): void => { raf = 0; setReferDraft(orderedRange(fromMs, at(atX))); };
+    const edge = edgeAutoScroll(scrollRef, () => { if (!raf) raf = requestAnimationFrame(flush); });
+    const move = (ev: PointerEvent) => {
+      atX = ev.clientX;
+      if (!dragged && Math.abs(ev.clientX - startX) < DRAG_THRESHOLD_PX) return;
+      dragged = true;
+      if (!raf) raf = requestAnimationFrame(flush);
+      edge.at(ev.clientX);
+    };
+    const up = (ev: PointerEvent) => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      edge.stop();
+      if (raf) cancelAnimationFrame(raf);
+      setReferDraft(null);
+      const range = orderedRange(fromMs, at(ev.clientX));
+      if (!dragged) onReferRuler({ atMs: fromMs });
+      else if (range) onReferRuler({ range });
+    };
+    window.addEventListener('pointermove', move, { passive: true });
+    window.addEventListener('pointerup', up);
+  }, [msAtClientX, onReferRuler, playable, totalMs]);
 
   /**
    * A press within ±4 px of the playhead line in the empty track space grabs the playhead. Not over a clip: a clip a
@@ -2071,6 +2158,9 @@ export const Timeline = React.memo(function Timeline({
   const seekRef = React.useRef<HTMLDivElement | null>(null);
   const focusTimeline = React.useCallback((e: React.PointerEvent) => {
     if (e.button !== 0 || isTypingTarget(e.target)) return;
+    /* a press in something portaled out of the timeline (a marker's card) is not on it; a marker's pin opens its card,
+       which takes the keys */
+    if (!e.currentTarget.contains(e.target as Node) || (e.target as Element).closest?.('[data-marker]')) return;
     window.setTimeout(() => {
       if (!isTypingTarget(document.activeElement)) seekRef.current?.focus({ preventScroll: true });
     }, 0);
@@ -2223,6 +2313,8 @@ export const Timeline = React.memo(function Timeline({
     const renamingHere = renaming != null && renaming === track.docIndex && track.index === 1;
     /* typing a name always has its field; a name given shows when the row has room for it */
     const nameLine = renamingHere || (Boolean(given) && h >= HEAD_NAME_MIN_H);
+    /* the main track is marked by its look (its band, the magnet by its badge), not by a name that reads as one */
+    const mainHead = Boolean(track.main) && track.index === 1;
     /* the track a pill hovered in the app's chat points at */
     const chatLit = chatTrack != null && track.docIndex === chatTrack;
     return (
@@ -2241,7 +2333,8 @@ export const Timeline = React.memo(function Timeline({
         onPointerDown={(e) => startLaneReorder(e, laneIndex)}
         onDoubleClick={() => { if (onRenameTrack && track.docIndex != null && track.index === 1) setRenaming(track.docIndex); }}
         onContextMenu={(e) => openHeadMenu(e, track)}
-        title={laneTitle}
+        title={mainHead ? `${laneTitle} · ${t('timeline.mainTrack')}` : laneTitle}
+        data-main-track={mainHead ? '' : undefined}
         style={{
           marginTop: GAP,
           height: h,
@@ -2334,6 +2427,9 @@ export const Timeline = React.memo(function Timeline({
           />
         ) : nameLine && given ? (
           <span className="col-span-full w-full min-w-0 justify-self-stretch truncate px-1 text-[10.5px] font-medium leading-[14px]" style={{ color: TL.text }} data-track-name="">{given}</span>
+        ) : null}
+        {mainHead ? (
+          <Magnet size={10} aria-label={t('timeline.mainTrack')} className="pointer-events-none absolute bottom-1 left-1.5" style={{ color: 'var(--tl-accent)' }} />
         ) : null}
         {onResizeTrack && track.docIndex != null ? <TrackResizeHandle height={h} onResize={(height, done) => onResizeTrack(track, height, done)} /> : null}
       </div>
@@ -3525,6 +3621,12 @@ export const Timeline = React.memo(function Timeline({
           </>
         ) : null}
 
+        {onAddMarker ? (
+          <ToolButton onClick={onAddMarker} disabled={!playable} label={t('editorTools.markerAdd')} hint={shortcutHint('M')}>
+            <MarkerGlyph size={16} />
+          </ToolButton>
+        ) : null}
+
         {onSplit ? (
           <ToolButton
             onClick={() => { void runSplit(selectedBlocks.filter((b) => drag.can(b).resize)); }}
@@ -3588,7 +3690,6 @@ export const Timeline = React.memo(function Timeline({
             </ToolButton>
           </span>
         </> : null}
-        {toolbarExtra}
 
         <ToolButton
           onClick={() => zoomBy(1 / ZOOM_STEP)}
@@ -3650,12 +3751,13 @@ export const Timeline = React.memo(function Timeline({
           {/* as tall as the ruler, so heads line up with rows; no bottom line, it is not a column of its own */}
           <div style={{ height: RULER_H }} />
           {subRowShown ? <SubtitleRowHead onAdd={() => subRowRef.current?.addAtPlayhead()} /> : null}
+          {markerRowH ? <div style={{ height: markerRowH }} /> : null}
           <div
             ref={headRef}
             className="relative overflow-hidden"
             /* the same padding as the track area, so both scroll the same height and scrollTop stays in sync */
             style={{
-              height: `calc(100% - ${RULER_H + subRowH}px - ${H_SCROLL_H}px)`,
+              height: `calc(100% - ${RULER_H + subRowH + markerRowH}px - ${H_SCROLL_H}px)`,
               paddingTop: padTop,
               paddingBottom: TL_VPAD,
             }}
@@ -3707,15 +3809,25 @@ export const Timeline = React.memo(function Timeline({
               aria-valuemax={Math.round(totalMs)}
               aria-valuenow={Math.round(timeMs)}
               aria-valuetext={`${formatTimecode(timeMs)} / ${formatTimecode(totalMs)}`}
-              onPointerDown={(e) => (e.shiftKey && onRangeChange ? startRange(e) : startScrub(e, true))}
+              onPointerDown={(e) => (e.shiftKey && onRangeChange ? startRange(e)
+                : onReferRuler && playheadGapPx(e.clientX, timeMsRef.current) > PLAYHEAD_GRAB_PX ? startRefer(e)
+                  : startScrub(e, true))}
               onKeyDown={onKeyDown}
+              onPointerMove={hoverRuler}
+              onPointerLeave={() => setRulerHoverMs(null)}
+              onContextMenu={rulerMenu ? (e) => {
+                e.preventDefault();
+                const items = rulerMenu(Math.max(0, Math.min(totalMs, msAtClientX(e.clientX))));
+                if (items.length) setRulerMenuAt({ x: e.clientX, y: e.clientY, items });
+              } : undefined}
               /* the point picked on the ruler is let go with the timeline's focus */
               onBlur={() => setBarFocus((f) => (f === 'point' ? null : f))}
               className="relative h-full touch-none select-none outline-none"
-              style={{ width: trackPx, cursor: 'col-resize' }}
+              /* pointing at time for the chat: a hand, and the moment under it drawn (the playhead's knob keeps its own) */
+              style={{ width: trackPx, cursor: onReferRuler ? (rulerHoverMs == null && !referDraft ? 'col-resize' : 'pointer') : 'col-resize' }}
             >
               {tickMarks}
-              {rulerOverlay?.(pxPerMs)}
+              {onReferRuler ? <RulerRefer hoverMs={rulerHoverMs} draft={referDraft} pxPerMs={pxPerMs} widthPx={trackPx} /> : null}
             </div>
           </div>
 
@@ -3723,6 +3835,26 @@ export const Timeline = React.memo(function Timeline({
             <SubtitleRow ref={subRowRef} spec={subtitleRow} pxPerMs={pxPerMs} scrollLeft={view.left} width={trackPx}
               playheadMs={() => timeMsRef.current} snap={snap} snapTargets={() => snapTargetsFor(allBlocks, null, timeMsRef.current)}
               onError={setDropError} />
+          ) : null}
+
+          {/* the markers' row: pins along it, scrolling with the tracks; a press between them moves the playhead (and
+              drags it) as in the tracks' empty space, a right-click adds a marker there */}
+          {markerRowH && markerLane ? (
+            <div
+              data-marker-lane=""
+              onPointerDown={(e) => startScrub(e)}
+              className="relative shrink-0 touch-none overflow-hidden select-none"
+              style={{ height: markerRowH, background: TL.head }}
+              onContextMenu={rulerMenu ? (e) => {
+                e.preventDefault();
+                const items = rulerMenu(Math.max(0, Math.min(totalMs, msAtClientX(e.clientX))));
+                if (items.length) setRulerMenuAt({ x: e.clientX, y: e.clientY, items });
+              } : undefined}
+            >
+              <div className="absolute inset-y-0 left-0" style={{ width: trackPx, transform: `translate3d(${-view.left}px,0,0)` }}>
+                {markerLane.render({ pxPerMs, widthPx: trackPx, snap: snapMarker, guide: setMarkerGuide })}
+              </div>
+            </div>
           ) : null}
 
           {/* track area: backgrounds fixed to the view, clips scroll horizontally above them */}
@@ -3757,10 +3889,14 @@ export const Timeline = React.memo(function Timeline({
             {!hasLanes && !landings.length ? (
               /* empty timeline: a dashed drop hint. Drops are handled on the whole right column, so dropping on the
                  hint adds the first clip and its track. */
-              <div className="flex h-full w-full items-center justify-center px-6">
-                <div className="pointer-events-none flex h-[44px] w-full max-w-[720px] items-center gap-2.5 rounded-[6px] border border-dashed border-[var(--border)] px-4">
-                  <Video size={15} className="shrink-0 text-[var(--text-faint)]" aria-hidden />
-                  <p className="truncate text-[11px] leading-relaxed text-[var(--text-faint)]">
+              <div className="flex h-full w-full items-center py-3 pl-1 pr-3">
+                <div
+                  data-timeline-empty=""
+                  className="pointer-events-none flex h-[60px] w-full items-center gap-2 rounded-[4px] border border-dashed px-4"
+                  style={{ background: TL.lane, borderColor: TL.line }}
+                >
+                  <Film size={15} className="shrink-0" style={{ color: TL.faint }} aria-hidden />
+                  <p className="truncate text-[12px]" style={{ color: TL.text }}>
                     {t('timeline.emptyStudio')}
                   </p>
                 </div>
@@ -3865,6 +4001,24 @@ export const Timeline = React.memo(function Timeline({
         </div>
       ) : null}
 
+      {/* a marker's guide, through the ruler and every row: where it is while it is hovered or dragged */}
+      {markerGuide ? (
+        <div
+          className="pointer-events-none absolute inset-y-0 z-[25] overflow-hidden"
+          style={{ left: headW - PLAYHEAD_BLEED, right: 0, top: TOOLBAR_H, bottom: H_SCROLL_H }}
+        >
+          <div
+            data-marker-guide=""
+            className="absolute inset-y-0 left-0 w-0"
+            style={{
+              borderLeft: `1px dashed ${markerGuide.color}`,
+              opacity: markerGuide.held ? 1 : 0.6,
+              transform: `translate3d(${markerGuide.ms * pxPerMs - scrollLeft + PLAYHEAD_BLEED}px,0,0)`,
+            }}
+          />
+        </div>
+      ) : null}
+
       {/* the snap guide: only when snapped to an edge; a thin accent line, nothing more */}
       {snapGuideMs != null ? (
         <div
@@ -3956,6 +4110,7 @@ export const Timeline = React.memo(function Timeline({
       {menu && menuItems.length ? (
         <ContextMenu x={menu.x} y={menu.y} items={menuItems} onClose={closeMenu} />
       ) : null}
+      {rulerMenuAt ? <ContextMenu x={rulerMenuAt.x} y={rulerMenuAt.y} items={rulerMenuAt.items} onClose={() => setRulerMenuAt(null)} /> : null}
     </div>
   );
 });
@@ -4345,4 +4500,49 @@ function edgeAutoScroll(
       raf = 0;
     },
   };
+}
+
+/** A moment as the chat's pills write it: m:ss.s. */
+const chatClock = (ms: number): string => {
+  const tenths = Math.round(ms / 100);
+  const m = Math.floor(tenths / 600);
+  return `${m}:${String(((tenths % 600) / 10).toFixed(1)).padStart(4, '0')}`;
+};
+
+/**
+ * What a click or a drag on the ruler gives the chat, drawn where it will be: under the pointer a line and a tag with
+ * the moment (the chat's mark and its time, as its pill will read), while dragged the span and its two ends. In the
+ * timeline's accent, as its switches; it takes no pointer.
+ */
+function RulerRefer({ hoverMs, draft, pxPerMs, widthPx }: { hoverMs: number | null; draft: FilmRange | null; pxPerMs: number; widthPx: number }) {
+  if (!draft && hoverMs == null) return null;
+  const tag = (x: number, text: string) => {
+    const flip = x > widthPx - 96;
+    return (
+      <span
+        className="absolute top-1/2 flex h-[15px] items-center gap-[3px] whitespace-nowrap rounded-[4px] px-[5px] text-[10px] font-medium leading-none tabular-nums text-white shadow-[0_1px_3px_rgba(0,0,0,.35)]"
+        style={{ left: x, background: 'var(--tl-accent)', transform: `translate(${flip ? 'calc(-100% - 5px)' : '5px'}, -50%)` }}
+      >
+        <MessageSquarePlus size={9} aria-hidden />
+        {text}
+      </span>
+    );
+  };
+  if (draft) {
+    const left = draft.startMs * pxPerMs;
+    const width = Math.max(1, (draft.endMs - draft.startMs) * pxPerMs);
+    return (
+      <div aria-hidden className="pointer-events-none absolute inset-0">
+        <div className="absolute inset-y-0" style={{ left, width, background: 'color-mix(in srgb, var(--tl-accent) 22%, transparent)', boxShadow: 'inset 1px 0 var(--tl-accent), inset -1px 0 var(--tl-accent)' }} />
+        {tag(left + width, `${chatClock(draft.startMs)}–${chatClock(draft.endMs)}`)}
+      </div>
+    );
+  }
+  const x = hoverMs! * pxPerMs;
+  return (
+    <div aria-hidden className="pointer-events-none absolute inset-0">
+      <div className="absolute inset-y-0 w-px" style={{ left: x, background: 'var(--tl-accent)' }} />
+      {tag(x, chatClock(hoverMs!))}
+    </div>
+  );
 }

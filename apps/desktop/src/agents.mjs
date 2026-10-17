@@ -24,14 +24,14 @@
  * Reads no Electron module, so `node --test` can use it.
  */
 import { execFile, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { arch, homedir, release, tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import * as acp from '@agentclientprotocol/sdk';
-import { PATH_SEP, childEnvironment, lastPathSource, loginShellEnvironment, loginShellVariables } from './environment.mjs';
+import { PATH_SEP, childEnvironment, lastPathSource, loginShellEnvironment, loginShellVariables, shellSubset } from './environment.mjs';
 import { AGENT_PROGRAMS, HOME_BIN_CANDIDATES, chosenProgram, consoleProgram, detectAgentInstallation, searchReport } from './agent-installation.mjs';
 import { nodeBinary } from './node-runtime.mjs';
 import { outOfBalance } from './pi-config.mjs';
@@ -54,6 +54,11 @@ export const AGENTS = Object.freeze({
     env: (path) => ({ CLAUDE_CODE_EXECUTABLE: path }),
     auth: ['auth', 'status'],
     login: ['auth', 'login'],
+    /* of the shell only its PATH, proxies, config folder and locale, as 0.1.5 had it and ChatCut has it: a key or
+       gateway set there (ANTHROPIC_*) would take the place of the person's Claude subscription */
+    fromShell: shellSubset,
+    /* signed in to the person's Claude subscription, the way its adapter offers it (ACP terminal auth), in Terminal */
+    acpSignIn: 'claude-ai-login',
     systemPrompt: true,
   },
   codex: {
@@ -313,7 +318,7 @@ export async function agentStatus(id, cliPath) {
   if (!spec || !cliPath) return { signedIn: null, account: null };
   if (!spec.auth) return { signedIn: await acpSignedIn(id), account: null };
   const how = starting(cliPath, spec.auth);
-  const r = await run(how.cmd, how.args, 10_000, { env: childEnvironment({ shell: await loginShellVariables(), extra: how.env }), options: how.options });
+  const r = await run(how.cmd, how.args, 10_000, { env: childEnvironment({ shell: agentShell(id, await loginShellVariables()), extra: how.env }), options: how.options });
   return readAgentStatus(id, r.stdout, r.out);
 }
 
@@ -385,24 +390,91 @@ export function signInScript(cliPath, args) {
   return `tell application "Terminal"\nactivate\ndo script "${command.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"\nend tell`;
 }
 
-/** Sign in: Terminal runs the program's own sign-in, which opens the maker's own page. The app touches nothing. */
+/**
+ * A PowerShell script that names its window and runs one program (`& 'program' 'arg'…`, each in single quotes, as
+ * PowerShell quotes): Windows sign-in. With a BOM, so Windows PowerShell reads a path with Chinese in it as UTF-8.
+ */
+export function powerShellScript(title, cmd, args) {
+  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  return `\ufeff$Host.UI.RawUI.WindowTitle = ${q(title)}\r\n& ${[cmd, ...args].map(q).join(' ')}\r\n`;
+}
+
+/** The person's shell variables as this agent is given them (`fromShell`; all of them, for most). */
+export function agentShell(id, shell) {
+  return AGENTS[id]?.fromShell?.(shell) ?? shell;
+}
+
+/**
+ * The ways an agent's adapter offers to sign in in a terminal (ACP terminal auth; Claude Code's: its subscription and
+ * Anthropic Console). `[{ id, name, description?, args, env }]`, asked of the adapter as it shakes hands; none for an
+ * agent signed in its own way (no `acpSignIn`) or one that cannot be started.
+ */
+export async function agentSignInMethods(id) {
+  const spec = AGENTS[id];
+  if (!spec?.acpSignIn) return [];
+  const shell = agentShell(id, await loginShellVariables());
+  const cli = resolveAgentCli(id, { pathDirs: shell.PATH.split(PATH_SEP) });
+  if (!cli) return [];
+  const launch = adapterLaunch(id, cli.path);
+  const child = spawn(launch.cmd, launch.args, { env: childEnvironment({ shell, extra: launch.env }), stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+  child.once('error', () => {});
+  try {
+    const conn = acp.client({ name: 'openfilm-desktop' }).connect(acp.ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout)));
+    const init = await Promise.race([
+      conn.agent.request(acp.methods.agent.initialize, { protocolVersion: acp.PROTOCOL_VERSION, clientCapabilities: CLIENT_CAPABILITIES, clientInfo: CLIENT_INFO }),
+      new Promise((_, fail) => setTimeout(() => fail(new Error('timed out')), 30_000)),
+    ]);
+    return (init.authMethods ?? []).filter((m) => m?.type === 'terminal' && m.id && m.name).map((m) => ({
+      id: String(m.id), name: String(m.name), ...(m.description ? { description: String(m.description) } : {}),
+      args: Array.isArray(m.args) ? m.args.map(String) : [], env: m.env && typeof m.env === 'object' ? m.env : {},
+    }));
+  } catch {
+    return [];
+  } finally {
+    child.kill();
+  }
+}
+
+/**
+ * Sign in: Terminal runs the program's own sign-in, which opens the maker's own page. The app touches nothing. One
+ * signed in the way its adapter offers (`acpSignIn`, that way's id) runs the adapter with that way's arguments, as ACP
+ * has a client do it.
+ */
 export async function openAgentSignIn(id) {
   const spec = AGENTS[id];
   const pathDirs = (await loginShellEnvironment()).PATH.split(PATH_SEP);
   const cli = spec ? resolveAgentCli(id, { pathDirs }) : null;
   if (!spec || !cli) return { ok: false, error: `${spec?.label ?? id} is not installed on this computer.` };
   asked.delete(id);
+  let how = null;
+  if (spec.acpSignIn) {
+    const way = (await agentSignInMethods(id)).find((w) => w.id === spec.acpSignIn);
+    if (!way) return { ok: false, error: `${spec.label} did not offer a way to sign in.` };
+    const launch = adapterLaunch(id, cli.path);
+    how = { cmd: launch.cmd, args: [...launch.args, ...way.args], env: { ...launch.env, ...way.env } };
+  }
   if (process.platform === 'win32') {
-    /* a command window of its own, left open so its sign-in can be read and answered (it runs a shim itself) */
-    const how = /\.(?:cmd|bat)$/i.test(cli.path) ? { cmd: cli.path, args: spec.login, env: {} } : starting(cli.path, spec.login);
+    /* a PowerShell window of its own running a script, as ChatCut does: no command line for cmd.exe to unquote (a path
+       with a space in it), and left open so its sign-in can be read and answered (it runs a shim itself) */
+    how ??= /\.(?:cmd|bat)$/i.test(cli.path) ? { cmd: cli.path, args: spec.login, env: {} } : starting(cli.path, spec.login);
     try {
-      spawn('cmd.exe', ['/d', '/c', 'start', `${spec.label} sign-in`, 'cmd.exe', '/k', how.cmd, ...how.args], {
-        detached: true, stdio: 'ignore', windowsHide: false, env: childEnvironment({ shell: await loginShellVariables(), extra: how.env }),
-      }).unref();
+      const dir = join(tmpdir(), 'openfilm-sign-in');
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, `${id}.ps1`);
+      writeFileSync(file, powerShellScript(`${spec.label} sign-in`, how.cmd, how.args), 'utf8');
+      const powershell = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const child = spawn(powershell, ['-NoLogo', '-NoExit', '-ExecutionPolicy', 'Bypass', '-File', file], {
+        detached: true, stdio: 'ignore', windowsHide: false, env: childEnvironment({ shell: agentShell(id, await loginShellVariables()), extra: how.env }),
+      });
+      await new Promise((done, fail) => { child.once('spawn', done); child.once('error', fail); });
+      child.unref();
       return { ok: true };
     } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
   }
-  const r = await run('/usr/bin/osascript', ['-e', signInScript(cli.path, spec.login)], 15_000);
+  const script = how
+    ? signInScript('/usr/bin/env', [...Object.entries(how.env).map(([k, v]) => `${k}=${v}`), how.cmd, ...how.args])
+    : signInScript(cli.path, spec.login);
+  const r = await run('/usr/bin/osascript', ['-e', script], 15_000);
   return r.ok ? { ok: true } : { ok: false, error: r.out.trim() || 'Terminal did not open.' };
 }
 
@@ -440,6 +512,17 @@ function adapterScript(pkg) {
   const json = JSON.parse(readFileSync(manifest, 'utf8'));
   const bin = typeof json.bin === 'string' ? json.bin : Object.values(json.bin ?? {})[0];
   return join(dirname(manifest), bin ?? json.main ?? 'index.js');
+}
+
+/** How an agent's adapter starts: the app's Node running its script (on Electron, through as-node.mjs), told where the person's program is. */
+function adapterLaunch(id, cliPath) {
+  const spec = AGENTS[id];
+  const node = nodeRuntime();
+  return {
+    cmd: node.command,
+    args: [...(node.env.ELECTRON_RUN_AS_NODE ? [AS_NODE] : []), adapterScript(spec.adapter)],
+    env: { ...node.env, ...spec.env(cliPath) },
+  };
 }
 
 function nodeRuntime() {
@@ -514,12 +597,16 @@ export function formContent(questions, answers) {
 /** What the app tells each agent, as it shakes hands, that the chat can do. */
 export const CLIENT_CAPABILITIES = {
   fs: { readTextFile: false, writeTextFile: false }, terminal: false, elicitation: { form: {} },
+  /* the person signs in in Terminal, the way the agent offers (agentSignInMethods) */
+  auth: { terminal: true },
   /* the agent's own warnings (Codex: "Falling back from WebSockets…") come as notices, not as words in its reply */
   session: { notices: {} },
   /* Claude Code's "recommended value" extension: its model and effort lists come without a "Default" row, the
      current value named for what it is */
   _meta: { jetbrains: { air: { version: 1, capabilities: ['recommendedValue'] } } },
 };
+
+const CLIENT_INFO = { name: 'openfilm-desktop', title: 'OpenFilm', version: '0.1.0' };
 
 /** ACP's auth_required: the agent wants its own sign-in first. */
 const AUTH_REQUIRED = -32000;
@@ -581,11 +668,11 @@ export class AgentSession {
 
   /**
    * Start the adapter, shake hands, open (or resume) the session. The agent gets all the person's login shell sets
-   * (their keys, gateways, tokens), as in their terminal, and the app's `openfilm` first on its PATH; the app's ffmpeg
-   * (`fallbackDir`) last, for a computer that has none of its own.
+   * (their keys, gateways, tokens; Claude Code only its PATH and the like, agentShell), as in their terminal, and the app's
+   * `openfilm` first on its PATH; the app's ffmpeg (`fallbackDir`) last, for a computer that has none of its own.
    */
   async start() {
-    const shell = await loginShellVariables({ staleOk: true });
+    const shell = agentShell(this.opts.agent, await loginShellVariables({ staleOk: true }));
     const harness = this.opts.harness ?? null;
     const cli = harness ? null : resolveAgentCli(this.opts.agent, { pathDirs: shell.PATH.split(PATH_SEP) });
     if (!harness && !cli) throw Object.assign(new Error(`${this.spec.label} is not installed on this computer.`), { code: 'not-installed' });
@@ -597,7 +684,7 @@ export class AgentSession {
     const own = !harness ? {} : {
       ...harness.env,
       OPENFILM_GET_WEB: '1',
-      OPENFILM_PI: JSON.stringify({ agentDir: harness.home, provider: harness.provider, model: harness.model, models: harness.models ?? [harness.model], systemPrompt: ownAgentPrompt() }),
+      OPENFILM_PI: JSON.stringify({ agentDir: harness.home, provider: harness.provider, model: harness.model, models: harness.models ?? [harness.model], efforts: harness.efforts ?? {}, systemPrompt: ownAgentPrompt() }),
     };
     /* an agent that speaks ACP itself: its own program, started as the registry starts it */
     const native = cli && !this.spec.adapter ? starting(cli.path, this.spec.args) : null;
@@ -612,8 +699,8 @@ export class AgentSession {
 
     const script = harness ? fileURLToPath(new URL('./pi-agent.mjs', import.meta.url)) : native ? null : adapterScript(this.spec.adapter);
     this.child = native
-      ? spawn(native.cmd, native.args, { ...native.options, cwd: this.opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
-      : spawn(node.command, [...(node.env.ELECTRON_RUN_AS_NODE ? [AS_NODE] : []), script], { cwd: this.opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+      ? spawn(native.cmd, native.args, { ...native.options, cwd: this.opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+      : spawn(node.command, [...(node.env.ELECTRON_RUN_AS_NODE ? [AS_NODE] : []), script], { cwd: this.opts.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     this.child.stderr.on('data', (d) => { this.stderr = (this.stderr + String(d)).slice(-16_000); });
     this.child.once('exit', (code) => this.opts.onExit?.({ code, stderr: this.stderr }));
     this.child.once('error', () => {});
@@ -639,7 +726,7 @@ export class AgentSession {
     const init = await this.conn.agent.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: CLIENT_CAPABILITIES,
-      clientInfo: { name: 'openfilm-desktop', title: 'OpenFilm', version: '0.1.0' },
+      clientInfo: CLIENT_INFO,
     });
 
     const params = {

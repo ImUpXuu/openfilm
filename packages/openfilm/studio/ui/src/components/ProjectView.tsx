@@ -40,7 +40,7 @@ import { splitHalves } from '@/lib/timeline-split';
 import { assetDropInsert, assetRunInsert, assetRunMs, pendingDropOf, soundLaneHit, withPendingBlocks, type AssetDropTarget, type AssetLaneHit, type AssetRunInsert, type PendingDrop } from '@/lib/asset-timeline';
 import { isComputerFileDrag, type ResourceDragItem } from '@/lib/resource-drag';
 import { ladderStepMs, THUMB_CELL_PX, thumbAnchorTimes } from '@/lib/thumb-cache';
-import { clipThumbId } from '@/lib/thumb-frame';
+import { clipThumbId, overridesToken } from '@/lib/thumb-frame';
 import { useLoadedThumbs } from '@/lib/use-loaded-thumbs';
 import { droppedOverrides, overrideTarget, undoneFields, type DroppedEdits, type PersonEdit } from '@/lib/dropped-overrides';
 import { filmFrameBox, type FilmFrameId } from '@/lib/film-frame';
@@ -96,6 +96,7 @@ import { FontScopeContext, type FontScope } from '@/lib/use-fonts';
 import { stageMenu, stageRecoveryMenu, type StageArrangeResult, type StageMenuContext } from './stage-menu';
 import type { StageEditFailure, StageTextEdit } from './FilmInspector';
 import { layerTarget, pageClipOf, recoverLayer } from '@/lib/stage-layers';
+import { pageClips, pageMayHave, similarEdits } from '@/lib/similar-layers';
 import type { MaskSession } from '@/lib/stage-mask';
 import type { MaskShape } from '@/lib/clip-mask';
 import { nextOverrides, overrideOf, type OverrideGeometry } from '@/lib/film-overrides';
@@ -1271,7 +1272,11 @@ export function ProjectView({ projectId, onProject, onLeave }: {
     const found = doc ? pageClipOf(doc, element) : null;
     const target = layerTarget(element, allCopies);
     if (!found || !target) return t('timeline.editFail');
-    const next = nextOverrides(found.clip.overrides, target, patch);
+    let next = nextOverrides(found.clip.overrides, target, patch);
+    /* the blocks written inside a line keep their place and look: their overrides go with it, one edit */
+    for (const r of await stageControl.current?.riders(element, patch) ?? []) {
+      next = nextOverrides(next ?? undefined, { at: r.at, ...(r.n != null ? { n: r.n } : {}) }, r.patch);
+    }
     /* the panel shows the new numbers at once; refused, they go back */
     const now = next ? overrideOf(next, target) : null;
     const before = element.override ?? null;
@@ -1306,7 +1311,11 @@ export function ProjectView({ projectId, onProject, onLeave }: {
       const target = layerTarget(element);
       if (!found || !target) continue;
       const prev = byClip.has(found.loc) ? byClip.get(found.loc) ?? undefined : found.clip.overrides;
-      byClip.set(found.loc, nextOverrides(prev, target, patch));
+      let next = nextOverrides(prev, target, patch);
+      for (const r of await stageControl.current?.riders(element, patch) ?? []) {
+        next = nextOverrides(next ?? undefined, { at: r.at, ...(r.n != null ? { n: r.n } : {}) }, r.patch);
+      }
+      byClip.set(found.loc, next);
     }
     if (!byClip.size) return t('timeline.editFail');
     return editBlocks([...byClip].map(([loc, value]) => ({ loc, prop: 'overrides', value: value as unknown as Record<string, unknown> | null })));
@@ -1316,10 +1325,38 @@ export function ProjectView({ projectId, onProject, onLeave }: {
     if (!held?.clipLoc) return t('timeline.editFail');
     const clean: Record<string, string | number | null> = {};
     for (const [key, v] of Object.entries(patch)) clean[key] = v ?? null;
-    const message = await editStageOverrideRef.current(held, { style: clean } as OverrideGeometry);
+    /* kept with what holds the other layers where they are (a wider font would push the words beside it on) */
+    const hold = await stageControl.current?.holdStyle(held, clean) ?? {};
+    const message = await editStageOverrideRef.current(held, { style: { ...clean, ...hold } } as OverrideGeometry);
     if (!message) setStageElement((cur) => (cur && (cur.loc === loc || cur.loc?.split('#')[0] === loc) ? { ...cur, style: { ...cur.style, ...patch } } : cur));
     return message;
   }, [t]);
+  /* "All like it": the style for every layer of its tag and classes, in each page clip that may have one
+     (lib/similar-layers), read from the pages' own files */
+  const similarClips = React.useCallback(async (element: StageElement): Promise<{ doc: FilmDoc; holds: Set<string> } | null> => {
+    const doc = filmRef.current as unknown as FilmDoc | null;
+    if (!doc || !element.similar) return null;
+    const srcs = [...new Set(pageClips(doc).map((c) => c.src))];
+    const sources = await Promise.all(srcs.map((src) => fetch(`${folder}${src.split('/').map(encodeURIComponent).join('/')}`, { cache: 'no-store' })
+      .then((r) => (r.ok ? r.text() : ''), () => '')));
+    return { doc, holds: new Set(srcs.filter((_, i) => pageMayHave(sources[i]!, element.similar!))) };
+  }, [folder]);
+  const countSimilar = React.useCallback(async (element: StageElement): Promise<number> => {
+    const found = await similarClips(element);
+    const own = found ? pageClipOf(found.doc, element)?.loc : undefined;
+    return found ? pageClips(found.doc).filter((c) => c.loc === own || found.holds.has(c.src)).length : 0;
+  }, [similarClips]);
+  const editStageStyleSimilar = React.useCallback(async (element: StageElement, patch: StageElementStyle): Promise<string | null> => {
+    const found = await similarClips(element);
+    const own = found ? pageClipOf(found.doc, element) : null;
+    if (!found || !own || !element.similar) return t('timeline.editFail');
+    const clean: Record<string, string | number | null> = {};
+    for (const [key, v] of Object.entries(patch)) clean[key] = v ?? null;
+    const edits = similarEdits(found.doc, element.similar, clean, (src) => found.holds.has(src), own.loc);
+    const message = await editBlocks(edits.map((e) => ({ loc: e.loc, prop: 'overrides', value: e.value as unknown as Record<string, unknown> | null })));
+    if (!message) setStageElement((cur) => (cur && cur.loc === element.loc ? { ...cur, style: { ...cur.style, ...patch } } : cur));
+    return message;
+  }, [similarClips, editBlocks, t]);
   const previewStageStyle = React.useCallback((_loc: string, patch: StageElementStyle) => {
     const held = stageElementRef.current;
     if (held) stageControl.current?.previewStyle(held, patch);
@@ -1330,11 +1367,14 @@ export function ProjectView({ projectId, onProject, onLeave }: {
   }, []);
   /* `on`: the element typed in, when it is known (typing in place); the inspector edits the one it shows. A double-click
      selects and types at once, so the element held may still be the one before: written to that, the edit failed */
-  const editStageText = React.useCallback(async (e: StageTextEdit, on?: StageElement): Promise<StageEditFailure | null> => {
+  /* kept with what holds the other layers where they are (more words would push those beside them on): `hold`, worked
+     out as the words were typed in place, else asked for now */
+  const editStageText = React.useCallback(async (e: StageTextEdit, on?: StageElement, typedHold?: Record<string, string | null>): Promise<StageEditFailure | null> => {
     const held = on ?? stageElementRef.current;
     if (!held?.clipLoc) return { error: t('timeline.editFail') };
+    const hold = typedHold ?? await stageControl.current?.holdStyle(held, {}, e.value) ?? {};
     stageControl.current?.previewText(held, e.value);
-    const failed = await editStageOverrideRef.current(held, { text: e.value } as OverrideGeometry);
+    const failed = await editStageOverrideRef.current(held, { text: e.value, ...(Object.keys(hold).length ? { style: hold } : {}) } as OverrideGeometry);
     if (failed) { stageControl.current?.previewText(held, e.expect); return { error: failed }; }
     setStageElement((el) => (el?.text?.loc === e.loc ? { ...el, text: { ...el.text, value: e.value }, label: e.value.slice(0, 40) } : el));
     return null;
@@ -1351,10 +1391,10 @@ export function ProjectView({ projectId, onProject, onLeave }: {
     void editStageOverrides(list.map(({ element, g }) => ({ element, patch: { t: g.t, s: compactScale(g.s[0], g.s[1]), r: g.r } })))
       .then((failed) => { if (failed) toast.show(failed); });
   }, [editStageOverrides, toast]);
-  const editStageTextInline = React.useCallback(async (element: StageElement, v: string) => {
+  const editStageTextInline = React.useCallback(async (element: StageElement, v: string, hold?: Record<string, string | null>) => {
     const text = element.text;
     if (!text) return t('timeline.editFail');
-    const failed = await editStageText({ loc: text.loc, value: v, expect: text.value }, element);
+    const failed = await editStageText({ loc: text.loc, value: v, expect: text.value }, element, hold ?? {});
     if (failed) {
       setInlineTextFailure((cur) => ({ loc: text.loc, value: v, failure: failed, seq: (cur?.seq ?? 0) + 1 }));
       return failed.error;
@@ -1507,6 +1547,12 @@ export function ProjectView({ projectId, onProject, onLeave }: {
     for (const b of what.blocks) refer(refOfBlock(b));
     if (what.range) refer(rangeRef(projectId, what.range, blocksRef.current));
   }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  /* the ruler points at time for the chat: a click, that moment; a drag, that span */
+  const referRuler = React.useCallback((what: { atMs: number } | { range: FilmRange }) => {
+    const refer = studioHost?.refer;
+    if (!refer) return;
+    refer('atMs' in what ? momentRef(projectId, what.atMs) : rangeRef(projectId, what.range, blocksRef.current));
+  }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
   const referFromStage = React.useCallback((picks: StagePick[]) => {
     const refer = studioHost?.refer;
     if (!refer) return;
@@ -1577,11 +1623,26 @@ export function ProjectView({ projectId, onProject, onLeave }: {
   /* a sound made again in place is heard as it is now, not as it was decoded */
   React.useEffect(() => { player.current.setVersions((src) => mtimeOf.get(src)); }, [mtimeOf]);
   refSource.current = { projectId, version: (path) => mtimeOf.get(path) };
+  /* a page clip's pictures are drawn with the changes made inside it (its overrides), by its id: changed, asked again */
+  const tweakTokens = React.useMemo(() => {
+    const out = new Map<string, string>();
+    for (const track of film.film?.tracks ?? []) {
+      for (const clip of track.clips) {
+        const token = clip.id && filmSrcIsPage(clip.src) ? overridesToken(clip.overrides) : '';
+        if (token) out.set(clip.id!, token);
+      }
+    }
+    return out;
+  }, [film.film]);
   const thumbs = React.useMemo(() => {
     const out = new Map<string, string>();
     if (!thumbView || !(thumbView.pxPerMs > 0)) return out;
-    /* a page's frames change with the files it loads too (filesTick: asked again, an unchanged one answered 304) */
-    const media = (path: string, ms: number) => `/api/projects/${encodeURIComponent(projectId)}/media?what=frame&path=${encodeURIComponent(path)}&ms=${Math.round(ms)}&w=${THUMB_CELL_PX * 2}&v=${mtimeOf.get(path) ?? 0}${filmSrcIsPage(path) ? `.${filesTick}` : ''}`;
+    /* a page's frames change with the files it loads too (filesTick: asked again, an unchanged one answered 304), and
+       with the clip's own changes (`clip`, and its token in the version) */
+    const media = (path: string, ms: number, clip?: string) => {
+      const token = clip ? tweakTokens.get(clip) : undefined;
+      return `/api/projects/${encodeURIComponent(projectId)}/media?what=frame&path=${encodeURIComponent(path)}&ms=${Math.round(ms)}&w=${THUMB_CELL_PX * 2}&v=${mtimeOf.get(path) ?? 0}${filmSrcIsPage(path) ? `.${filesTick}` : ''}${token ? `.${token}&clip=${encodeURIComponent(clip!)}` : ''}`;
+    };
     const span = thumbView.toMs - thumbView.fromMs;
     const fromMs = Math.max(0, thumbView.fromMs - span);
     const toMs = thumbView.toMs + span;
@@ -1592,7 +1653,8 @@ export function ProjectView({ projectId, onProject, onLeave }: {
     const margins: Array<[string, string]> = [];
     for (const b of pictures) {
       const still = /\.(png|jpe?g|webp|avif|gif|bmp|svg)$/i.test(b.src!);
-      const key = (into: number) => `${mtimeOf.get(b.src!) ?? 0}:${clipThumbId(b)}@${into}#v`;
+      const token = b.clipId ? tweakTokens.get(b.clipId) ?? '' : '';
+      const key = (into: number) => `${mtimeOf.get(b.src!) ?? 0}${token ? `.${token}` : ''}:${clipThumbId(b)}@${into}#v`;
       if (still) { out.set(key(0), `${folder}${b.src!.split('/').map(encodeURIComponent).join('/')}`); continue; }
       const speed = b.speed && b.speed > 0 ? b.speed : 1;
       const trimMs = (b.anchor?.trimFrom ?? 0) * 1000;
@@ -1614,14 +1676,14 @@ export function ProjectView({ projectId, onProject, onLeave }: {
       const own = { startMs: trimMs, endMs: trimMs + (b.endMs - b.startMs) * speed };
       for (const at of [...grid, ...thumbAnchorTimes({ times: grid, spans: [own] })]) {
         const drawn = b.kind === 'mg' ? Math.round(Math.max(at, Math.min(at + stepMs / 2, lastMs))) : at;
-        if (at >= own.startMs - stepMs && at <= own.endMs) out.set(key(at), media(b.src!, drawn));
-        else margins.push([key(at), media(b.src!, drawn)]);
+        if (at >= own.startMs - stepMs && at <= own.endMs) out.set(key(at), media(b.src!, drawn, b.clipId));
+        else margins.push([key(at), media(b.src!, drawn, b.clipId)]);
       }
     }
     for (const [k, u] of margins) if (!out.has(k)) out.set(k, u);
     return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [thumbView, timelineTracks, projectId, mtimeOf, folder, filesTick]);
+  }, [thumbView, timelineTracks, projectId, mtimeOf, folder, filesTick, tweakTokens]);
   /* drawn once loaded: a zoom keeps the pictures it has until the new shots arrive */
   const shownThumbs = useLoadedThumbs(thumbs);
   const posters = React.useMemo(() => {
@@ -2602,6 +2664,8 @@ export function ProjectView({ projectId, onProject, onLeave }: {
                       width={inspectorShownWidth}
                       onClose={closeInspector}
                       onEditStyle={editStageStyle}
+                      onEditSimilar={editStageStyleSimilar}
+                      countSimilar={countSimilar}
                       onPreviewStyle={previewStageStyle}
                       onPreviewText={previewStageText}
                       onEditText={editStageText}
@@ -2656,7 +2720,7 @@ export function ProjectView({ projectId, onProject, onLeave }: {
                     onRangeChange={setMarkedRange}
                     trackMenuExtra={trackMenuExtra}
                     {...(studioHost?.refer ? {
-                      onReferBlocks: referBlocks, rangeRef: markedRangeRef, onReferSelection: referFromTimeline,
+                      onReferBlocks: referBlocks, rangeRef: markedRangeRef, onReferSelection: referFromTimeline, onReferRuler: referRuler,
                     } : {})}
                     commandsRef={timelineCommands}
                     trackNames={trackNames}

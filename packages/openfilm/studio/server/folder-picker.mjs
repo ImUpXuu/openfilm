@@ -69,6 +69,8 @@ export function folderPickerCommand(platform, { title, at }, has = () => true) {
   }
   if (platform === 'win32') {
     const script = [
+      // Match execFile's UTF-8 decoding, including paths outside the Windows console code page.
+      '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding',
       'Add-Type -AssemblyName System.Windows.Forms',
       '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
       '$d.Description = $env:OPENFILM_PICK_TITLE',
@@ -112,6 +114,8 @@ export function filePickerCommand(platform, { title, at }, has = () => true) {
   }
   if (platform === 'win32') {
     const script = [
+      // Match execFile's UTF-8 decoding, including paths outside the Windows console code page.
+      '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding',
       'Add-Type -AssemblyName System.Windows.Forms',
       '$d = New-Object System.Windows.Forms.OpenFileDialog',
       '$d.Title = $env:OPENFILM_PICK_TITLE',
@@ -165,7 +169,7 @@ export function pickFolder(ask) {
   const command = folderPickerCommand(process.platform, { ...ask, at: startFolder(ask.at) }, onPath);
   if (!command) return Promise.reject(new Error('no folder dialog on this system'));
   return new Promise((resolve, reject) => {
-    execFile(command.cmd, command.args, { env: { ...process.env, ...command.env }, windowsHide: false, timeout: 15 * 60_000 }, (error, stdout) => {
+    execFile(command.cmd, command.args, { env: { ...process.env, ...command.env }, encoding: 'utf8', windowsHide: false, timeout: 15 * 60_000 }, (error, stdout) => {
       const path = String(stdout).trim().replace(/[\\/]+$/, '') || (String(stdout).trim() === '/' ? '/' : '');
       if (path) { resolve(path); return; }
       if (cancelled(command.cmd, error)) { resolve(null); return; }
@@ -184,7 +188,7 @@ export function pickFiles(ask) {
   const command = filePickerCommand(process.platform, { ...ask, at: startFolder(ask.at) }, onPath);
   if (!command) return Promise.reject(new Error('no file dialog on this system'));
   return new Promise((resolve, reject) => {
-    execFile(command.cmd, command.args, { env: { ...process.env, ...command.env }, windowsHide: false, timeout: 15 * 60_000 }, (error, stdout) => {
+    execFile(command.cmd, command.args, { env: { ...process.env, ...command.env }, encoding: 'utf8', windowsHide: false, timeout: 15 * 60_000 }, (error, stdout) => {
       const paths = String(stdout).split(/\r?\n/).map((line) => line.trim()).filter((line) => line && isAbsolute(line));
       if (paths.length) { resolve(paths); return; }
       if (cancelled(command.cmd, error)) { resolve([]); return; }
