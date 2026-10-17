@@ -7,6 +7,15 @@ import { chatDir, loadChat, logsDir, openLog, readLog, refsDir, saveRefImage, sa
 
 const project = () => mkdtempSync(join(tmpdir(), 'of-chat-'));
 const turn = (id, createdAt) => ({ turn: { id, createdAt, sessionId: 's1', prompt: id }, items: [{ kind: 'text', text: id }] });
+/** a turn's log is written through a stream: wait until its lines are on disk (a slow runner needs more than a fixed pause) */
+async function logOnDisk(dir, id, lines = 1) {
+  for (let i = 0; i < 500; i += 1) {
+    const read = readLog(dir, id);
+    if (read && read.events.length >= lines) return read;
+    await new Promise((done) => setTimeout(done, 10));
+  }
+  return readLog(dir, id);
+}
 
 test('a project with no chat yet has none; what is saved comes back, the turns in the order they were asked', () => {
   const dir = project();
@@ -29,7 +38,7 @@ test('a turn is written to its log as it happens and read back, a broken last li
   log.write('update', { update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hi' } } });
   log.write('done', { ok: true, stopReason: 'end_turn' });
   log.end();
-  await new Promise((done) => setTimeout(done, 50));
+  await logOnDisk(dir, 't1', 3);
   appendFileSync(join(logsDir(dir), 't1.jsonl'), '{"t":1,"kind":"upd');
   const read = readLog(dir, 't1');
   assert.deepEqual(read.events.map((e) => e.kind), ['prompt', 'update', 'done']);
@@ -43,9 +52,9 @@ test('a local turn\'s id (local:…) names a file any system allows', async () =
   const log = openLog(dir, 'local:abc123');
   log.write('prompt', {});
   log.end();
-  await new Promise((done) => setTimeout(done, 50));
+  const read = await logOnDisk(dir, 'local:abc123');
   assert.deepEqual(loadChat(dir).turns.map((t) => t.turn.id), ['local:abc123']);
-  assert.ok(readLog(dir, 'local:abc123').file.endsWith('local-abc123.jsonl'));
+  assert.ok(read.file.endsWith('local-abc123.jsonl'));
 });
 
 test('ids that are not ids name no file', () => {
